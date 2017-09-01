@@ -1,0 +1,5 @@
+CREATE OR REPLACE PROCEDURE sp_format
+    IS
+BEGIN
+    NULL;
+END;
