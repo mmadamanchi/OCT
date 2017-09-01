@@ -1,2 +1,5690 @@
-# OCT
-Application PL/SQL Code
+create or replace PACKAGE BODY PKG_MRP 
+IS
+PROCEDURE LP_UPDATE_WO_SO_PO_STATUS
+IS
+V_LAST_PEGG_RUN  DATE;
+  
+TYPE WO_STATUS_REC IS RECORD(WORK_ORDER_NO MFG_WORK_ORDER.WORK_ORDER_NO%TYPE,
+                             STATUS MFG_WORK_ORDER.STATUS%TYPE,
+                             CLOSE_DATE DATE,
+                             PRIORITY_CODE NUMBER
+                             );                              
+TYPE WO_STATUS_TYPE IS TABLE OF WO_STATUS_REC INDEX BY PLS_INTEGER;
+WO_STATUS_TAB WO_STATUS_TYPE;
+
+BEGIN
+  SELECT MAX(CREATED_DATE)-3 
+  INTO V_LAST_PEGG_RUN
+  FROM INV_ALLOCATION ;
+  V_LAST_PEGG_RUN := NVL(V_LAST_PEGG_RUN,(SYSDATE-5));
+-- SO STATUS UPDATE START
+DELETE FROM MRP_DOC_NO;
+
+     Declare
+     V_Status Varchar2(100);
+     Begin
+INSERT INTO MRP_DOC_NO(DOC_NO)
+SELECT ORDER_NO  FROM SD_ORDER_DETAIL WHERE CREATED_DATE >= V_LAST_PEGG_RUN OR CHANGED_DATE >= V_LAST_PEGG_RUN
+UNION 
+SELECT ORDER_NO  FROM SD_PACKING_SLIP_DETAIL WHERE CREATED_DATE >= V_LAST_PEGG_RUN OR CHANGED_DATE >= V_LAST_PEGG_RUN
+UNION 
+SELECT ORDER_NO FROM SD_ORDER_HEADER WHERE STATUS IS NULL;
+       For I In (Select Order_No From Sd_Order_Header WHERE ORDER_NO IN (SELECT DOC_NO FROM MRP_DOC_NO)) Loop
+           V_Status := Pkg_Status.Sf_Order_Status('SD_ORDER_HEADER',I.Order_No,Null,Null,Null,Null,Null);
+           UPDATE SD_ORDER_HEADER
+              SET STATUS = V_STATUS
+            WHERE ORDER_NO = I.ORDER_NO;
+           UPDATE SD_ORDER_DETAIL
+              SET Order_Priority_Code = NVL(Order_Priority_Code,100)
+            WHERE ORDER_NO = I.ORDER_NO;
+       End Loop;
+     end;
+DELETE FROM MRP_DOC_NO;     
+-- SO STATUS UPDATE END
+
+--WO STATUS UPDATE START
+SELECT WO.WORK_ORDER_NO,
+CASE WHEN RELEASE_DATE IS NOT NULL AND (R_APP_SETTINGS.CLOSE_WO_AUTOMATICALLY = 'N' OR R_APP_SETTINGS.CLOSE_WO_PERCENTAGE_BALANCE = 0)
+                                          AND (NVL(COMPLETED_QTY,0)+NVL(SCRAP_QTY,0)) >= WO.WO_QTY THEN 'CL'
+            WHEN RELEASE_DATE IS NOT NULL AND (R_APP_SETTINGS.CLOSE_WO_AUTOMATICALLY = 'N' OR R_APP_SETTINGS.CLOSE_WO_PERCENTAGE_BALANCE = 0)
+                                          AND (NVL(COMPLETED_QTY,0)+NVL(SCRAP_QTY,0)) < WO.WO_QTY THEN 'OR'
+            WHEN RELEASE_DATE IS NOT NULL AND (NVL(COMPLETED_QTY,0)+NVL(SCRAP_QTY,0)) >= 
+                (((100-NVL(R_APP_SETTINGS.CLOSE_WO_PERCENTAGE_BALANCE,0))/100)*WO.WO_QTY) AND R_APP_SETTINGS.CLOSE_WO_AUTOMATICALLY = 'Y' THEN 'CL'
+            WHEN RELEASE_DATE IS NOT NULL 
+                 AND (NVL(COMPLETED_QTY,0)+NVL(SCRAP_QTY,0)) < 
+                (((100-NVL(R_APP_SETTINGS.CLOSE_WO_PERCENTAGE_BALANCE,0))/100)*WO.WO_QTY) AND R_APP_SETTINGS.CLOSE_WO_AUTOMATICALLY = 'Y' THEN 'OR'
+            WHEN RELEASE_DATE IS NULL THEN 'ON'
+            WHEN CLOSE_DATE IS NOT NULL THEN 'CL'
+            ELSE 'OR'
+            END 
+            AS STATUS ,
+            V_SYSDATE,NVL(PRIORITY_CODE,100)
+          BULK COLLECT INTO   WO_STATUS_TAB          
+            FROM MFG_WORK_ORDER WO
+            LEFT OUTER JOIN 
+            (SELECT WORK_ORDER_NO,
+                SUM (DECODE(UPPER (TC_REPORTING_TYPE),'COMPLETION',GOOD_QTY)) AS COMPLETED_QTY,
+                SUM (DECODE(UPPER (TC_REPORTING_TYPE),'MOVE',SCRAP_QTY,'RUN',SCRAP_QTY)) AS SCRAP_QTY
+                FROM MFG_TC_DETAIL Z
+                WHERE UPPER (TC_REPORTING_TYPE) IN ('COMPLETION','MOVE','RUN')
+                GROUP BY WORK_ORDER_NO
+             ) TC
+             ON WO.WORK_ORDER_NO = TC.WORK_ORDER_NO
+             WHERE NOT EXISTS (
+                              SELECT NULL 
+                              FROM MFG_WORK_ORDER IWO
+                              WHERE WO.WORK_ORDER_NO = IWO.WORK_ORDER_NO
+                              AND IWO.CLOSE_DATE IS NOT NULL 
+                              AND IWO.STATUS = 'CL'
+                              );
+
+FORALL I IN   WO_STATUS_TAB.FIRST..WO_STATUS_TAB.LAST
+  UPDATE MFG_WORK_ORDER
+  SET STATUS = WO_STATUS_TAB(I).STATUS,
+      CLOSE_DATE = CASE WHEN WO_STATUS_TAB(I).STATUS = 'CL' AND CLOSE_DATE IS NULL THEN V_SYSDATE ELSE CLOSE_DATE END ,
+      PRIORITY_CODE = WO_STATUS_TAB(I).PRIORITY_CODE
+  WHERE WORK_ORDER_NO = WO_STATUS_TAB(I).WORK_ORDER_NO;
+COMMIT;
+-- WO STATUS UPDATE END
+
+-- PO STATUS START
+Declare
+V_Status Varchar2(100);
+Begin
+DELETE FROM MRP_DOC_NO;
+INSERT INTO MRP_DOC_NO(DOC_NO)
+SELECT PO_NO  FROM PO_LINE WHERE CREATED_DATE >= V_LAST_PEGG_RUN OR CHANGED_DATE >= V_LAST_PEGG_RUN
+UNION 
+SELECT PO_NO  FROM PO_RECEIPT_LINE WHERE CREATED_DATE >= V_LAST_PEGG_RUN OR CHANGED_DATE >= V_LAST_PEGG_RUN
+UNION 
+SELECT PO_NO  FROM PO_RETURNS_LINE WHERE CREATED_DATE >= V_LAST_PEGG_RUN OR CHANGED_DATE >= V_LAST_PEGG_RUN;
+
+for I in (select PO_NO from PO_HEADER WHERE PO_NO IN (SELECT DOC_NO FROM MRP_DOC_NO) ) LOOP
+    V_Status := Pkg_Status.Sf_Check_Status( 'PO_HEADER', I.Po_No ,Null,Null,Null,Null,Null);
+    Update Po_Header
+       Set Status = V_Status
+     Where Po_No  = I.Po_No;
+ End Loop;
+End;
+DELETE FROM MRP_DOC_NO;
+-- PO STATUS END
+
+END LP_UPDATE_WO_SO_PO_STATUS;
+
+PROCEDURE LP_GET_APP_SETTINGS
+IS
+BEGIN
+  SELECT NVL(CLOSE_WO_AUTOMATICALLY,'Y') ,
+         NVL(CLOSE_WO_PERCENTAGE_BALANCE,0),
+         NVL(REORDER_POINT_FLG,'N'),
+         NVL(IM_LEAD_TIME,'M'),
+         NVL(HARD_PEGGING_WINDOW_DAYS,0),
+         NVL(REV_NO_REQUIRED_MAT_PLANNING,'N'),
+         NVL(HARD_PEGGING_WINDOW_DAYS_TYPE,'M'),
+         NVL(CALCULATE_OP_LEAD_TIME,'O'),
+         NVL(WO_CHILD_INTACT_FLG,'Y'),
+         NVL(STOCK_WINDOW_DAYS_FLG,'N'),
+         NVL(WO_WINDOW_DAYS_FLG,'N'),
+         NVL(WO_OUTSIDE_WINDOW_DAYS_FLG,'A'),
+         NVL(PO_WINDOW_DAYS_FLG,'N'),
+         NVL(PO_OUTSIDE_WINDOW_DAYS_FLG,'A')
+  INTO R_APP_SETTINGS
+  FROM GL_BUSINESS_UNITS 
+  WHERE BUSINESS_UNIT_CODE = PKG_MRP.V_BUC;
+END LP_GET_APP_SETTINGS;
+PROCEDURE LP_INSERT_TEMP_DATA
+IS
+  TYPE WO_NO_REC IS RECORD(WORK_ORDER_NO MFG_WORK_ORDER.WORK_ORDER_NO%TYPE);
+  TYPE WO_NO_TYPE IS TABLE OF WO_NO_REC INDEX BY PLS_INTEGER;
+  WO_NO_TAB WO_NO_TYPE;
+
+V_EXECUTION_TIME char(1) default 'Y';
+v_Start_date             TIMESTAMP(6);
+v_start_time             number;
+  
+BEGIN
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('...1.Pegging LP_INSERT_TEMP_DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+-- UPDATIG RUSH FALG AS NO IF SO LINE DUE DATE IS NOT FALLING WITH IN WINDOW DAYS,START
+       UPDATE MFG_WORK_ORDER 
+          SET RUSH_FLG='N'
+         WHERE WORK_ORDER_NO IN (                              
+                                   SELECT SW.WORK_ORDER_NO
+                                     FROM V_MRP_SO_PACKING_SLIP_DETAILS PD
+                                     JOIN MFG_WO_SALES_ORDERS SW 
+                                       ON (SW.SALES_ORDER_NO = PD.ORDER_NO
+                                           AND SW.ORDER_LINE_NO = PD.LINE_NO) 
+                                     JOIN V_MRP_WO_INFO WO
+                                       ON WO.WORK_ORDER_NO = SW.WORK_ORDER_NO
+                                    WHERE NVL(WO.RUSH_FLG,'N') = 'Y'
+                                      AND PD.ORDER_DOC_TYPE NOT IN ('S','E')
+                                      AND PD.BALANCE_QTY_BASE_UOM > 0 
+                                      AND PD.STATUS = 'Open'
+                                      AND R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS <> 0 
+                                      AND PD.DUE_DATE > V_SYSDATE+ R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS
+                                    )
+       AND NVL(RUSH_FLG,'N') = 'Y'                                      
+       RETURNING WORK_ORDER_NO BULK COLLECT INTO WO_NO_TAB; 
+    IF V_EXECUTION_TIME='Y' THEN
+      SP_PROCESSING_TIME('...1.Pegging LP_INSERT_TEMP_DATA' ,V_START_DATE ,
+      NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+    END IF;
+    
+    IF V_EXECUTION_TIME='Y' THEN
+      V_START_DATE    :=SYSDATE;
+      V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+      SP_PROCESSING_TIME('......2.Pegging LP_INSERT_TEMP_DATA' ,V_START_DATE ,
+      NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+    END IF;
+
+   FORALL D IN WO_NO_TAB.FIRST..WO_NO_TAB.LAST
+    DELETE FROM MFG_WO_SALES_ORDERS WHERE WORK_ORDER_NO =WO_NO_TAB(D).WORK_ORDER_NO;
+   WO_NO_TAB.DELETE;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('......2.Pegging LP_INSERT_TEMP_DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;   
+-- UPDATIG RUSH FALG AS NO IF SO LINE DUE DATE IS NOT FALLING WITH IN WINDOW DAYS,END
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('.........3.Pegging G_MRP_STOCK' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+-- INSERTING STOCK 
+DELETE FROM G_MRP_STOCK;
+INSERT INTO G_MRP_STOCK(
+                        ITEM_NO ,REV_NO ,LOT_NO ,
+                        SERIAL_NO ,WORK_ORDER_NO  ,STEP_ID  ,
+                        LOW_LEVEL_CODE  ,LOCATION_NO  ,TRANSACTION_DATE ,
+                        BALANCE_AVAILABLE ,INVENTORY_UOM_BALANCE_QTY  ,ALLOTED_QTY  ,
+                        AVAILABLE_QTY
+                        )
+                SELECT  ITEM_NO ,NULL REV_NO  ,LOT_NO ,
+                        NULL SERIAL_NO ,NULL WORK_ORDER_NO ,NULL STEP_ID ,
+                        NULL LOW_LEVEL_CODE ,NULL LOCATION_NO ,NULL TRANSACTION_DATE , 
+                        SUM(BALANCE_AVAILABLE) BALANCE_AVAILABLE , 
+                        SUM(INVENTORY_UOM_BALANCE_QTY) INVENTORY_UOM_BALANCE_QTY ,
+                        0 ALLOTED_QTY ,
+                        SUM(BALANCE_AVAILABLE) AVAILABLE_QTY
+                FROM V_INVENTORY_OHQTY
+                WHERE R_APP_SETTINGS.REV_NO_REQUIRED_MAT_PLANNING = 'N'
+                GROUP BY ITEM_NO,  LOT_NO
+                HAVING SUM(BALANCE_AVAILABLE)	 > 0
+                UNION ALL
+                SELECT ITEM_NO ,REV_NO ,LOT_NO ,
+                       NULL SERIAL_NO ,NULL WORK_ORDER_NO ,NULL STEP_ID ,
+                       NULL LOW_LEVEL_CODE ,NULL LOCATION_NO ,NULL TRANSACTION_DATE , 
+                       SUM(BALANCE_AVAILABLE) BALANCE_AVAILABLE , 
+                       SUM(INVENTORY_UOM_BALANCE_QTY) INVENTORY_UOM_BALANCE_QTY ,
+                       0 ALLOTED_QTY ,
+                       SUM(BALANCE_AVAILABLE) AVAILABLE_QTY
+                FROM V_INVENTORY_OHQTY
+                WHERE R_APP_SETTINGS.REV_NO_REQUIRED_MAT_PLANNING = 'Y'
+                GROUP BY ITEM_NO, REV_NO, LOT_NO
+                HAVING SUM(BALANCE_AVAILABLE)	 > 0;
+
+        IF V_EXECUTION_TIME='Y' THEN
+          SP_PROCESSING_TIME('.........3.Pegging G_MRP_STOCK' ,V_START_DATE ,
+          NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+        END IF;
+        EXECUTE IMMEDIATE 'Truncate Table a_DEFAULT_BOM_ROUTING_ID1';
+        insert into a_DEFAULT_BOM_ROUTING_ID1(RECORD_NO, BOM_ROUTING_ID, VERSION_ID, BOM_ROUTING_REV_NO, DEFAULT_ROUTING, DEFAULT_VERSION, PARENT_NO, ITEM_REVISION_NO, CUSTOMER_NO, BATCH_SIZE, QTY_PER_CYCLE, LINE_NO, COMPONENT_NO, OPERATION_NO, DESCRIP, QTY, CURRENT_REVISION_NO, COMP_ITEM_REVISION_NO, STEP_ID, BOM_BATCH_SIZE, BOM_BOM_TYPE)
+        select 
+        RECORD_NO, BOM_ROUTING_ID, VERSION_ID, BOM_ROUTING_REV_NO, DEFAULT_ROUTING, DEFAULT_VERSION, PARENT_NO, ITEM_REVISION_NO, CUSTOMER_NO, BATCH_SIZE, QTY_PER_CYCLE, LINE_NO, COMPONENT_NO, OPERATION_NO, DESCRIP, QTY, CURRENT_REVISION_NO, COMP_ITEM_REVISION_NO, STEP_ID, BOM_BATCH_SIZE, BOM_BOM_TYPE
+        from v_DEFAULT_BOM_ROUTING_ID1;
+        
+        IF V_EXECUTION_TIME='Y' THEN
+          V_START_DATE    :=SYSDATE;
+          V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+          SP_PROCESSING_TIME('............4.Pegging G_MRP_LEADTIME_HRS_CF' ,V_START_DATE ,
+          NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+        END IF;
+
+-- INSERTING PROCESSING HOURS OF WO
+INSERT INTO G_MRP_LEADTIME_HRS_CF
+              (
+                WORK_ORDER_NO            ,	ITEM_NO                  ,	CAPACITY_FAMILY          ,
+                OPERATION_TYPE           ,	PROCESS_RATE_TYPE        ,	PROCESS_HRS              ,
+                SETUP_TIME               ,	WORKING_HOURS            ,	MOVE_HOURS               ,
+                QUEUE_HOURS              ,	BATCH_SIZE               ,	LABOR_EFFICIENCY_FACTOR  ,
+                NO_CAP_CENTERS           ,	STEP_ID                  
+              )
+SELECT 
+        WORK_ORDER_NO            ,	ITEM_NO                  ,	CAPACITY_FAMILY          ,
+        OPERATION_TYPE           ,	PROCESS_RATE_TYPE        ,	PROCESS_HRS              ,
+        SETUP_TIME               ,	WORKING_HOURS            ,	MOVE_HOURS               ,
+        QUEUE_HOURS              ,	BATCH_SIZE               ,	LABOR_EFFICIENCY_FACTOR  ,
+        NO_CAP_CENTERS           ,	STEP_ID                  
+FROM  V_MRP_LEADTIME_HRS_CF;
+
+ EXECUTE IMMEDIATE 'Truncate Table a_Mrp_Leadtime_Hrs_Cf';
+      
+      insert into a_Mrp_Leadtime_Hrs_Cf
+      (
+        WORK_ORDER_NO     ,WORKING_HOURS     ,SETUP_TIME        ,QUEUE_HOURS       ,
+        PROCESS_RATE_TYPE ,PROCESS_HRS       ,OPERATION_TYPE    ,MOVE_HOURS        ,
+        ITEM_NO           ,CAPACITY_FAMILY   ,BATCH_SIZE,
+        LABOR_EFFICIENCY_FACTOR      ,       NO_CAP_CENTERS ,STEP_ID
+      )
+      select 
+      WORK_ORDER_NO     ,WORKING_HOURS     ,SETUP_TIME        ,QUEUE_HOURS       ,
+      PROCESS_RATE_TYPE ,PROCESS_HRS       ,OPERATION_TYPE    ,MOVE_HOURS        ,
+      ITEM_NO           ,CAPACITY_FAMILY   ,BATCH_SIZE,
+      LABOR_EFFICIENCY_FACTOR      ,       NO_CAP_CENTERS ,STEP_ID
+      from G_MRP_LEADTIME_HRS_CF;
+      commit;
+
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('............4.Pegging G_MRP_LEADTIME_HRS_CF' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('...............5.Pegging G_MRP_SD_ORDER_DETAIL' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+-- INSERT SD ORDER DETAILS
+DELETE FROM G_MRP_SD_ORDER_DETAIL;
+INSERT INTO G_MRP_SD_ORDER_DETAIL
+(
+	ORDER_NO                     ,	LINE_NO                      ,	DUE_DATE                     ,
+  ITEM_NO                      ,	ITEM_REVISION_NO             ,	ORDER_PRIORITY_CODE          ,
+	BUSINESS_UNIT_CODE           ,	PEGGING_TYPE                 ,	BALANCE_QTY_BUOM             ,
+	CUM_MRP_LEAD_TIME            
+)
+SELECT 
+     SD.ORDER_NO , SD.LINE_NO          , SD.DUE_DATE            ,
+     SD.ITEM_NO  , SD.ITEM_REVISION_NO , SD.ORDER_PRIORITY_CODE ,
+     SD.BUSINESS_UNIT_CODE , NULL      , SD.BALANCE_QTY_BASE_UOM,
+     NVL(IM.CUM_MRP_LEAD_TIME,0) CUM_MRP_LEAD_TIME
+FROM 
+  V_MRP_SO_PACKING_SLIP_DETAILS SD,
+  IM_ITEMS IM
+WHERE SD.ORDER_DOC_TYPE NOT IN ('S','E')  
+  AND SD.STATUS = 'Open'
+  AND SD.BALANCE_QTY_BASE_UOM > 0 
+  AND SD.ITEM_NO = IM.ITEM_NO; 
+
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('...............5.Pegging G_MRP_SD_ORDER_DETAIL' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('..................6.Pegging MRP_WORK_ORDER_PEGG' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+-- INSERTING WO DETAILS,START
+DELETE FROM MRP_WORK_ORDER_PEGG WOT;
+--WHERE NOT EXISTS 
+--                (
+--                SELECT NULL 
+--                 FROM V_MRP_WO_INFO WO
+--                WHERE WO.WORK_ORDER_NO = WOT.WORK_ORDER_NO
+--                  AND WO.BALANCE_QTY = WOT.BALANCE_QTY
+--                );
+                
+INSERT INTO MRP_WORK_ORDER_PEGG
+            (
+             WORK_ORDER_NO   ,BALANCE_QTY     ,ITEM_NO         ,
+             WORK_ORDER_TYPE ,STD_SCRAP_QTY   ,RUSH_FLG        ,
+             RELEASE_DATE ,PROCESSING_DAYS
+             ) 
+SELECT DISTINCT 
+            WORK_ORDER_NO   ,BALANCE_QTY     ,ITEM_NO         ,
+            WORK_ORDER_TYPE ,STD_SCRAP_QTY   ,RUSH_FLG        ,
+            RELEASE_DATE , SF_GET_LEAD_TIME_DAYS(ITEM_NO,BALANCE_QTY,WORK_ORDER_NO)
+FROM V_MRP_WO_INFO WO
+WHERE BALANCE_QTY >0
+AND NOT EXISTS 
+              (
+              SELECT NULL
+                FROM MRP_WORK_ORDER_PEGG WOT
+               WHERE WOT.WORK_ORDER_NO = WO.WORK_ORDER_NO
+              );
+--RETURNING WORK_ORDER_NO BULK COLLECT INTO WO_NO_TAB;
+              
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('..................6.Pegging MRP_WORK_ORDER_PEGG' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+-- INSERTING WO DETAILS,END
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('.....................7.Pegging PROCESSING_DAYS' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+-- UPDATING PROCESSING DAYS IN WO AND SO ,START
+    IF R_APP_SETTINGS.IM_LEAD_TIME = 'C'
+    THEN
+       UPDATE MFG_WORK_ORDER WO
+          SET PROCESSING_DAYS = NVL((SELECT CASE WHEN PROCESSING_DAYS > 365 THEN 365 ELSE PROCESSING_DAYS END
+                                  FROM MRP_WORK_ORDER_PEGG WOT
+                                  WHERE WOT.WORK_ORDER_NO = WO.WORK_ORDER_NO
+                                ),WO.PROCESSING_DAYS);
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('.....................7.Pegging PROCESSING_DAYS' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+COMMIT;
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('........................8.Pegging G_MRP_SD_ORDER_DETAIL' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+    UPDATE G_MRP_SD_ORDER_DETAIL O
+       SET cum_mrp_lead_time=
+                    nvl((select  LEAD  from MRP_PREV_SD_ORDER_DETAIL I
+                                      where I.order_no=O.order_no
+                                        and I.line_no=O.line_no
+                                        and I.BALANCE_QTY=BALANCE_QTY_BUOM
+                                        AND NVL(I.WINDOW_DAYS_TYPE,'#')=R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS_TYPE
+                                        AND NVL(I.CALCULATE_OP_LEAD_TIME,'#') = R_APP_SETTINGS.CALCULATE_OP_LEAD_TIME),0); 
+                                        
+        DECLARE
+           TYPE CUM_REC_TYPE IS RECORD
+           (
+              ITEM_NO                 G_MRP_SD_ORDER_DETAIL.ITEM_NO%TYPE,
+              BALANCE_QTY_BUOM        G_MRP_SD_ORDER_DETAIL.BALANCE_QTY_BUOM%TYPE,
+              cum_mrp_lead_time       G_MRP_SD_ORDER_DETAIL.cum_mrp_lead_time%TYPE
+           );
+           TYPE CUM_REC_TYPE_t IS TABLE OF CUM_REC_TYPE;
+           V_CUM_REC_TYPE_t   CUM_REC_TYPE_t;
+        BEGIN
+                --SInce lead time not computed last run or quantity is changed
+                --Process days are computed.
+                --Same Item, Qty will have same processing days, once computed updated to all macthing item and qty  
+                SELECT ITEM_NO,BALANCE_QTY_BUOM,
+                           /*CEIL(NVL(SF_GET_ITEM_Cum_LEAD_DAYS2(ITEM_NO,BALANCE_QTY_BUOM,R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS_TYPE),0))*/ 0 cum_mrp_lead_time
+                          BULK COLLECT INTO V_CUM_REC_TYPE_t
+                          from (select distinct ITEM_NO ITEM_NO ,BALANCE_QTY_BUOM BALANCE_QTY_BUOM
+                          from G_MRP_SD_ORDER_DETAIL
+                          where cum_mrp_lead_time=0);
+                         
+          IF V_CUM_REC_TYPE_t.COUNT >0 THEN
+               FOR indx IN 1 .. V_CUM_REC_TYPE_t.COUNT
+               LOOP
+                  update G_MRP_SD_ORDER_DETAIL
+                    set cum_mrp_lead_time=V_CUM_REC_TYPE_t(indx).cum_mrp_lead_time
+                      where ITEM_NO=V_CUM_REC_TYPE_t(indx).ITEM_NO
+                        and BALANCE_QTY_BUOM=V_CUM_REC_TYPE_t(indx).BALANCE_QTY_BUOM;
+               END LOOP;
+          END IF;
+        END;
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('........................8.Pegging G_MRP_SD_ORDER_DETAIL' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('........................9.Pegging MRP_PREV_SD_ORDER_DETAIL' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+        EXECUTE IMMEDIATE 'Truncate Table MRP_PREV_SD_ORDER_DETAIL';
+        insert into MRP_PREV_SD_ORDER_DETAIL (
+        ORDER_NO         ,
+        LINE_NO          ,
+        ITEM_NO          ,
+        BALANCE_QTY      ,
+        LEAD             ,
+        WINDOW_DAYS_TYPE,
+		    CALCULATE_OP_LEAD_TIME)
+        SELECT ORDER_NO ,
+              LINE_NO ,
+              ITEM_NO ,
+              BALANCE_QTY_BUOM ,
+              CUM_MRP_LEAD_TIME ,
+              R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS_TYPE ,
+              R_APP_SETTINGS.CALCULATE_OP_LEAD_TIME
+            FROM G_MRP_SD_ORDER_DETAIL;
+            COMMIT;
+        --updating the base table processing days
+        update SD_ORDER_DETAIL 
+          set PROCESSING_DAYS =
+        nvl((select CASE WHEN c.LEAD > 400 THEN 365 ELSE c.LEAD END LEAD  from  MRP_PREV_SD_ORDER_DETAIL c
+        where c.ORDER_NO         =SD_ORDER_DETAIL.ORDER_NO
+        and c.LINE_NO =SD_ORDER_DETAIL.LINE_NO
+        and c.ITEM_NO =SD_ORDER_DETAIL.ITEM_NO
+        ),PROCESSING_DAYS)
+        WHERE (ORDER_NO,LINE_NO) IN (SELECT ORDER_NO,LINE_NO FROM MRP_PREV_SD_ORDER_DETAIL) ;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('........................9.Pegging MRP_PREV_SD_ORDER_DETAIL' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;                                
+    ELSE
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('........................10.Pegging WO PROCESSING_DAYS' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;    
+    
+       UPDATE MFG_WORK_ORDER WO
+          SET PROCESSING_DAYS = (SELECT IM.CUM_MRP_LEAD_TIME
+                                 FROM IM_ITEMS IM
+                                 WHERE IM.ITEM_NO = WO.ITEM_NO
+                                 )
+        WHERE WO.STATUS <> 'CL';
+       
+       UPDATE SD_ORDER_DETAIL SD
+          SET PROCESSING_DAYS = (SELECT IM.CUM_MRP_LEAD_TIME
+                                 FROM IM_ITEMS IM
+                                 WHERE IM.ITEM_NO = SD.ITEM_NO
+                                 )
+        WHERE SD.ORDER_NO IN (SELECT SH.ORDER_NO
+                                FROM SD_ORDER_HEADER SH
+                                WHERE SH.STATUS='Open'
+                                );
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('........................10.Pegging WO PROCESSING_DAYS' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;    
+    END IF;
+-- UPDATING PROCESSING DAYS IN WO AND SO ,END
+COMMIT;
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('........................11.Pegging WO MRP_ALLOCATION_PREV_RUN' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+-- INSERTING PREV RUN RESULTS, START 
+UPDATE INV_ALLOCATION
+SET ALLOCATE_FROM = (CASE WHEN WORK_ORDER_NO = 'STOCK' THEN 'STOCK' 
+                                                                    WHEN  WORK_ORDER_NO = 'NO-PLAN' THEN 'NO-PLAN' 
+                                                                    WHEN  WORK_ORDER_NO = 'ISSUED' THEN 'ISSUED' 
+                                                                    WHEN  WORK_ORDER_NO IS NULL  THEN 'PO' 
+                                                                    ELSE 'WO' END)
+WHERE  ALLOCATE_FROM IS NULL; 
+
+DELETE FROM MRP_ALLOCATION_PREV_RUN;
+INSERT INTO MRP_ALLOCATION_PREV_RUN
+(
+	SEQ_NO                        ,ORDER_NO                      ,LINE_NO                       ,
+	DUE_DATE                      ,ITEM_NO                       ,ITEM_REVISION_NO              ,
+	QTY                           ,ALLOCATION_TYPE               ,PEGGING_TYPE                  ,
+	WORK_ORDER_NO                 ,LOT_NO                        ,PO_NO                         ,
+	PO_LINE_NO                    ,PARENT_SEQ_NO                 ,SO_WO_LINK                    ,
+	ORDER_SOFT_OR_HARD            ,PEGGING_WITHIN_LEAD_TIME      ,ALLOCATE_FROM                 ,
+  ALLOCATED_QTY                 ,AVAILABLE_QTY                   ,PARENT_ORDER_NO               ,
+  PARENT_ORDER_line_NO
+
+)
+SELECT 
+	SEQ_NO                        ,ORDER_NO                      ,LINE_NO                       ,
+	DUE_DATE                      ,ITEM_NO                       ,ITEM_REVISION_NO              ,
+	QTY                           ,ALLOCATION_TYPE               ,PEGGING_TYPE                  ,
+	WORK_ORDER_NO                 ,LOT_NO                        ,PO_NO                         ,
+	PO_LINE_NO                    ,PARENT_SEQ_NO                 ,NULL SO_WO_LINK               ,
+	NULL ORDER_SOFT_OR_HARD            ,PEGGING_WITHIN_LEAD_TIME      ,ALLOCATE_FROM            ,
+  0                             ,QTY                             ,PARENT_ORDER_NO               ,
+  PARENT_ORDER_line_NO
+FROM --MRP_ALLOCATION_TEMP AT/*MMD : THIS TABLE NEED TO CHANGE TO INV_ALLOCATION ONCE EVERUTHING IS DONE */
+      INV_ALLOCATION AT/*MMD : THIS TABLE NEED TO CHANGE TO INV_ALLOCATION ONCE EVERUTHING IS DONE */
+WHERE ALLOCATION_TYPE IN ( 'SO_WO' ,'QT_WO','QT_CO','WO_CO' )
+  AND ALLOCATE_FROM IN ('STOCK','PO','WO')
+  AND  EXISTS (SELECT NULL
+                FROM SD_ORDER_DETAIL SD  
+                     JOIN SD_ORDER_HEADER SH
+                 ON (SD.ORDER_NO = SH.ORDER_NO)
+                WHERE SH.STATUS = 'Open' 
+                AND ( NVL(SH.ALLOCATION_TYPE,'S') = 'H'
+                      OR  
+                     (SD.DUE_DATE <= R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS+V_SYSDATE 
+                       AND R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS <> 0
+                      )
+                     )
+                 AND SD.ORDER_NO = AT.PARENT_ORDER_NO    
+                 AND SD.LINE_NO = AT.PARENT_ORDER_LINE_NO    
+                );
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('........................11.Pegging WO MRP_ALLOCATION_PREV_RUN' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;    
+COMMIT;
+-- INSERTING PREV RUN RESULTS, END
+END LP_INSERT_TEMP_DATA;  
+
+FUNCTION LF_CURSOR
+RETURN NUMBER
+IS
+BEGIN
+    SELECT ITEM_NO ,Low_Level_Code,ADD_QC_SCRAP_PERCEN_PER_WO,ADD_QC_SCRAP_QTY_PER_WO
+    BULK COLLECT INTO ITEM_TAB
+    FROM IM_ITEMS 
+    WHERE  INCLUDE_MRP='Y' 
+      AND NVL(INACTIVE,'N') = 'N'    
+--    AND ITEM_NO = 'JS'
+    ORDER BY LOW_LEVEL_CODE;
+    RETURN 1;
+END LF_CURSOR;
+PROCEDURE SP_ALLOCATION_AUDIT
+IS
+v_cnt pls_integer;
+V_PRINT BOOLEAN DEFAULT FALSE;
+BEGIN
+
+--1
+-- -VE QTY OR ZERO RECORDS INSERTION CHECKING
+  select count(1)
+  into v_cnt
+  FROM mRP_ALLOCATION_temp 
+  WHERE QTY = 0 ;
+if v_cnt >0 then  
+V_PRINT := TRUE;
+end if;  
+
+  select count(1)
+  into v_cnt
+  FROM mRP_ALLOCATION_temp 
+  WHERE QTY < 0 ;
+if v_cnt >0 then 
+  V_PRINT := TRUE;
+end if;  
+
+
+--2
+-- IF ALLOCATED ISSUED QTY IS MORE THAN ACTUAL ISSUED QTY
+SELECT COUNT(1)
+INTO V_CNT 
+FROM 
+(
+SELECT WORK_ORDER_NO,STEP_ID,BALANCE_IN_ISSUED_QTY AS QTY
+FROM v_wo_bom_balance_qty_mmd/*V_MRP_WO_BOM_BALANCE_QTY*/
+) I
+JOIN 
+(
+SELECT ORDER_NO AS WORK_ORDER_NO,
+  LINE_NO STEP_ID,SUM(QTY) QTY
+FROM MRP_ALLOCATION_TEMP
+WHERE WORK_ORDER_NO='ISSUED'
+GROUP BY ORDER_NO ,
+  LINE_NO
+  ) A
+ON (I.WORK_ORDER_NO = A.WORK_ORDER_NO
+    AND I.STEP_ID = A.STEP_ID)  
+WHERE I.QTY < A.QTY;  
+
+IF V_CNT > 0 THEN
+  for iss in (
+                SELECT a.WORK_ORDER_NO,a.STEP_ID
+              FROM 
+              (
+              SELECT WORK_ORDER_NO,STEP_ID,BALANCE_IN_ISSUED_QTY AS QTY
+              FROM v_wo_bom_balance_qty_mmd/*V_MRP_WO_BOM_BALANCE_QTY*/
+              ) I
+              JOIN 
+              (
+              SELECT ORDER_NO AS WORK_ORDER_NO,
+                LINE_NO STEP_ID,SUM(QTY) QTY
+              FROM MRP_ALLOCATION_TEMP
+              WHERE WORK_ORDER_NO='ISSUED'
+              GROUP BY ORDER_NO ,
+                LINE_NO
+                ) A
+              ON (I.WORK_ORDER_NO = A.WORK_ORDER_NO
+                  AND I.STEP_ID = A.STEP_ID)  
+              WHERE I.QTY < A.QTY
+          )
+  Loop
+null;
+  end loop;
+  V_PRINT := TRUE;
+end if;
+
+--3
+-- IF DEMAND QTY AND ALLOCATED QTY ARE NOT MATCHING THEN BELOW REPORT WILL DETAILS OF THOSE
+v_cnt := 0;
+
+SELECT COUNT(1)
+INTO v_cnt
+--ALLOC.ORDER_NO,ALLOC.LINE_NO,ALLOC.ALLOC_QTY,SO.SO_QTY
+FROM 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) AS ALLOC_QTY
+  FROM MRP_ALLOCATION_TEMP
+GROUP BY ORDER_NO,LINE_NO
+) ALLOC
+JOIN 
+(SELECT ORDER_NO, LINE_NO,SUM(BALANCE_QTY_BASE_UOM) AS SO_QTY
+FROM V_MRP_SO_PACKING_SLIP_DETAILS
+GROUP BY ORDER_NO, LINE_NO
+) SO
+ON (ALLOC.ORDER_NO = SO.ORDER_NO
+    AND ALLOC.LINE_NO = SO.LINE_NO )
+WHERE ALLOC.ALLOC_QTY<>SO.SO_QTY    ;
+
+IF NVL(v_cnt,0) > 0 THEN 
+V_PRINT := TRUE;
+END IF;
+
+-- checking all sales ordres got pegged or not 
+SELECT count(1)
+into v_cnt 
+--MRP.ORDER_NO MRP_ORDER,MRP.LINE_NO MRP_LINE,MRP_QTY,
+--SO.ORDER_NO BASE_ORDER,SO.LINE_NO BASE_LINE,SO_QTY,item_no
+FROM 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) MRP_QTY
+  FROM MRP_ALLOCATION_TEMP
+WHERE ALLOCATION_TYPE = 'SO_WO' 
+AND ORDER_NO NOT LIKE 'ROP%'
+AND ORDER_NO NOT LIKE '%QC_ALL%'
+AND ORDER_NO NOT LIKE '%SAFETY STOCK%'
+GROUP BY ORDER_NO,LINE_NO
+) MRP
+FULL OUTER JOIN 
+(
+SELECT ORDER_NO ,
+  LINE_NO ,
+  V_MRP_SO_PACKING_SLIP_DETAILS.item_no,
+  DUE_DATE,
+  BALANCE_QTY_BASE_UOM SO_QTY
+FROM V_MRP_SO_PACKING_SLIP_DETAILS ,im_items 
+WHERE STATUS = 'Open'
+and ORDER_DOC_TYPE NOT IN ('S','E')
+and line_no <> 0
+AND INCLUDE_MRP='Y' 
+AND NVL(INACTIVE,'N') = 'N' 
+and im_items.item_no = V_MRP_SO_PACKING_SLIP_DETAILS.item_no
+and due_date is not null
+) SO
+ON( MRP.ORDER_NO = SO.ORDER_NO
+    AND MRP.LINE_NO = SO.LINE_NO
+  )
+WHERE  NVL(SO_QTY,0) <> NVL(MRP_QTY,0);
+IF NVL(v_cnt,0) > 0 THEN 
+V_PRINT := TRUE;
+END IF;
+
+
+--4
+-- IF WO ALLOCATED QTY IS MORE TAN WO BALANCE QTY BELOW QUERY WILL GIVE THESE DETAILS
+V_CNT := 0;
+SELECT COUNT(1)
+INTO V_CNT
+--WO.WORK_ORDER_NO,WO.QTY WO_QTY,ALLOC.QTY AS ALLOC_QTY
+FROM 
+(SELECT DISTINCT WORK_ORDER_NO,BALANCE_QTY_NEW AS QTY
+FROM V_MRP_WO_INFO
+) WO
+JOIN 
+(
+SELECT WORK_ORDER_NO,SUM(QTY) AS QTY
+FROM MRP_ALLOCATION_TEMP
+WHERE
+--NVL(work_order_no,'NULL') not in ('ISSUED','NULL','STOCK')
+ALLOCATE_FROM = 'WO'
+AND ORDER_NO NOT LIKE '%QC%'
+GROUP BY WORK_ORDER_NO
+) ALLOC
+ON (ALLOC.WORK_ORDER_NO = WO.WORK_ORDER_NO)
+WHERE ALLOC.QTY > WO.QTY;
+
+IF v_cnt > 0 THEN 
+V_PRINT := TRUE;
+END IF;
+
+--5
+-- OLD AND NEW SO VIEW BALANCES CHEKCING
+-- CHECKING OLD VIEW AND NEW VIEW BALANCES
+SELECT COUNT(1)
+INTO v_cnt
+--NEW_V.ORDER_NO,NEW_V.LINE_NO,NEW_QTY,OLD_QTY
+FROM 
+(
+SELECT ORDER_NO ,
+  LINE_NO ,
+  BALANCE_QTY_BASE_UOM NEW_QTY
+FROM V_MRP_SO_PACKING_SLIP_DETAILS 
+) NEW_V
+FULL OUTER JOIN
+(
+SELECT ORDER_NO ,
+  LINE_NO ,
+  BALANCE_QTY_BASE_UOM OLD_QTY
+FROM V_ORDER_PACKING_SLIP_DETAILS
+) OLD_V
+ON ( NEW_V.ORDER_NO = OLD_V.ORDER_NO
+AND NEW_V.LINE_NO = OLD_V.LINE_NO)
+WHERE  NVL(NEW_QTY,0) <> NVL(OLD_QTY,0);
+
+IF v_cnt > 0 THEN 
+V_PRINT := TRUE;
+END IF;
+
+-- 6
+-- inv_allocation and mrp_allocation difference checking
+SELECT count(1)
+into v_cnt
+--INV.ORDER_NO INV_ORDER,INV.LINE_NO INV_LINE,INV.INV_QTY,
+--MRP.ORDER_NO MRP_ORDER,MRP.LINE_NO MRP_LINE,MRP.MRP_QTY
+FROM 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) INV_QTY
+  FROM INV_ALLOCATION
+WHERE ALLOCATION_TYPE = 'SO_WO'  
+GROUP BY ORDER_NO,LINE_NO
+) INV
+FULL OUTER JOIN 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) MRP_QTY
+  FROM MRP_ALLOCATION_TEMP
+WHERE ALLOCATION_TYPE = 'SO_WO'  
+GROUP BY ORDER_NO,LINE_NO
+) MRP
+ON (INV.ORDER_NO = MRP.ORDER_NO
+    AND 
+    INV.LINE_NO = MRP.LINE_NO
+    )
+WHERE   NVL(INV.INV_QTY,0) <> NVL(MRP.MRP_QTY,0)  ;
+
+--IF v_cnt > 0 THEN 
+--   display_pf(v_cnt ||' : so_wo inv_allocation and mrp_allocation difference are there : ');
+--END IF;
+
+SELECT count(1)
+into v_cnt
+--INV.ORDER_NO INV_ORDER,INV.LINE_NO INV_LINE,INV.INV_QTY,
+--MRP.ORDER_NO MRP_ORDER,MRP.LINE_NO MRP_LINE,MRP.MRP_QTY
+FROM 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) INV_QTY
+  FROM INV_ALLOCATION
+WHERE ALLOCATION_TYPE = 'BOM_CO'  
+GROUP BY ORDER_NO,LINE_NO
+) INV
+JOIN 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) MRP_QTY
+  FROM MRP_ALLOCATION_TEMP
+WHERE ALLOCATION_TYPE = 'BOM_CO'  
+GROUP BY ORDER_NO,LINE_NO
+) MRP
+ON (INV.ORDER_NO = MRP.ORDER_NO
+    AND 
+    INV.LINE_NO = MRP.LINE_NO
+    )
+WHERE   INV.INV_QTY <> MRP.MRP_QTY  ;
+
+--IF v_cnt > 0 THEN 
+--   display_pf(v_cnt ||' : BOM_CO inv_allocation and mrp_allocation difference are there : ');
+--END IF;
+
+
+SELECT count(1)
+into v_cnt
+--INV.ORDER_NO INV_ORDER,INV.LINE_NO INV_LINE,INV.INV_QTY,
+--MRP.ORDER_NO MRP_ORDER,MRP.LINE_NO MRP_LINE,MRP.MRP_QTY
+FROM 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) INV_QTY
+  FROM INV_ALLOCATION
+WHERE ALLOCATION_TYPE = 'WO_CO'  
+GROUP BY ORDER_NO,LINE_NO
+) INV
+FULL OUTER JOIN 
+(
+SELECT ORDER_NO,LINE_NO,SUM(QTY) MRP_QTY
+  FROM MRP_ALLOCATION_TEMP
+WHERE ALLOCATION_TYPE = 'WO_CO'  
+GROUP BY ORDER_NO,LINE_NO
+) MRP
+ON (INV.ORDER_NO = MRP.ORDER_NO
+    AND 
+    INV.LINE_NO = MRP.LINE_NO
+    )
+WHERE   NVL(INV.INV_QTY,0) <> NVL(MRP.MRP_QTY,0)  ;
+
+--IF v_cnt > 0 THEN 
+--   display_pf(v_cnt ||' : WO_CO inv_allocation and mrp_allocation difference are there : ');
+--END IF;
+
+
+--7.WO REQUIRED AND ALLOCATED QTY ARE DIFFERENT
+--
+SELECT COUNT(1)
+INTO v_cnt 
+--DISTINCT E.ORDER_NO ,  E.LINE_NO ,
+--  E.REQ_QTY ,  A.ALLOC_QTY
+FROM
+  (
+    SELECT A.WORK_ORDER_NO AS ORDER_NO ,
+      WB.STEP_ID           AS LINE_NO ,
+      ITEM_NO ,
+      (
+        CASE
+          WHEN WB.BOM_TYPE='MP'
+          THEN A.QTY*WB.QTY_REQUIRED_PER_CYCLE
+          WHEN WB.BOM_TYPE='MB'
+          THEN(QTY/BATCH_SIZE)*QTY_REQUIRED_PER_CYCLE
+          ELSE WB.QTY_REQUIRED_PER_CYCLE
+        END) AS REQ_QTY
+    FROM
+      (
+        SELECT A.WORK_ORDER_NO ,
+          B.BALANCE_QTY_NEW AS QTY
+          --      A.QTY AS QTY
+        FROM
+          (
+            SELECT WORK_ORDER_NO ,
+              SUM(QTY) QTY
+            FROM MRP_ALLOCATION_TEMP
+            WHERE ALLOCATE_FROM='WO'
+            GROUP BY WORK_ORDER_NO
+          )
+          A ,
+          V_MRP_WO_INFO B
+        WHERE A.WORK_ORDER_NO=B.WORK_ORDER_NO
+      )
+      A
+    JOIN
+      (
+        SELECT WORK_ORDER_NO ,
+          STEP_ID ,
+          ITEM_NO ,
+          BOM_TYPE ,
+          QTY_REQUIRED_PER_CYCLE ,
+          BATCH_SIZE ,
+          CONSUMED_IN_ROUTING_STEP
+        FROM MFG_WO_BOM
+      )
+      WB
+    ON
+      (
+        A.WORK_ORDER_NO=WB.WORK_ORDER_NO
+      )
+    WHERE NOT EXISTS
+      (
+        SELECT NULL
+        FROM MFG_WO_ROUTING WR
+        WHERE WR.WORK_ORDER_NO     =WB.WORK_ORDER_NO
+        AND WR.STEP_ID             =NVL(WB.CONSUMED_IN_ROUTING_STEP ,99999)
+        AND WR.STEP_COMPLETE_DATE IS NOT NULL
+      )
+  )
+  E
+JOIN
+  (
+    SELECT ORDER_NO ,
+      LINE_NO ,
+      ITEM_NO ,
+      SUM(QTY) AS ALLOC_QTY
+    FROM MRP_ALLOCATION_TEMP
+      --    WHERE NVL(SO_WO_LINK,'M') = 'Y'
+    GROUP BY ORDER_NO ,
+      LINE_NO ,
+      ITEM_NO
+  )
+  A
+ON
+  (
+    A.ORDER_NO =E.ORDER_NO
+  AND A.LINE_NO=E.LINE_NO
+  AND A.LINE_NO=E.LINE_NO
+  )
+WHERE ROUND(REQ_QTY)<>ROUND(ALLOC_QTY);
+--ORDER BY 1,2;
+IF v_cnt > 0 THEN 
+V_PRINT := TRUE;
+--  display_pf(v_cnt ||' : WO REQUIRED AND ALLOCATED QTY ARE DIFFERENT : ');
+END IF;
+
+--5
+-- alloc qty and req qty are not match
+-- recepie1
+--declare
+--cursor C1 is
+--select ORDER_NO,wo_qty as qty
+--from V_PEGGING_AUDIT1,MFG_WORK_ORDER
+--where order_no = work_order_no;
+--begin
+--for I in C1 LOOP
+--SP_COMPUTE_WO_PRHRS_TOTQTY(i.order_no,i.qty);
+--end loop;
+--end;
+--/
+If 1=1 Then 
+  V_Print := True;
+--  Display_Pf('Pending Audits :');  
+--  Display_Pf('1. When Available stock is there system should not insert NO-PLAN records');  
+--  Display_Pf('2. parent seq_no and allocated qty should match.');  
+END IF;
+
+
+IF NOT V_PRINT THEN 
+--DISPLAY_PF('----ALLOCATION HAPPEND PROPERLY IT SEEMS---');  
+null;
+END IF;
+--DISPLAY_PF('--------------AUDIT REPORT END--------------');  
+END SP_ALLOCATION_AUDIT;
+
+PROCEDURE LP_CLEAR_TEMP_DATA
+IS
+BEGIN
+  DELETE FROM G_MRP_STOCK;
+  DELETE FROM G_MRP_LEADTIME_HRS_CF;
+  DELETE FROM G_MRP_SD_ORDER_DETAIL;
+END LP_CLEAR_TEMP_DATA;
+FUNCTION SF_ALLOCATE(P_ITEM_NO VARCHAR2,P_ITEM_REVISION_NO VARCHAR2,P_QTY NUMBER)
+RETURN NUMBER
+IS
+V_STOCK_INDEX VARCHAR2(150);
+BEGIN
+---- STOCK ALLOCATION, START
+--V_STOCK_INDEX := P_Item_No||'~'||1;
+--If Stock_Tab.Exists(V_STOCK_INDEX) Then
+--  For I In 1..1000
+--  Loop
+--    If Stock_Tab.Exists(V_STOCK_INDEX) Then
+--      If R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+--        And Stock_Tab(V_STOCK_INDEX).Rev_No = Hd.Item_Revision_No 
+--        And Stock_Tab(V_STOCK_INDEX).Available_Qty >0 
+--      Then
+--      ALLOCATION_TAB.QTY := CASE WHEN P_QTY > Stock_Tab(V_STOCK_INDEX).Available_Qty 
+--                                  THEN Stock_Tab(V_STOCK_INDEX).Available_Qty
+--                                  ELSE P_QTY
+--                                  END;
+--      
+--      P_QTY := P_QTY-ALLOCATION_TAB.QTY;
+--      
+--      Stock_Tab(V_STOCK_INDEX).Available_Qty 
+--            := Stock_Tab(V_STOCK_INDEXI).Available_Qty-ALLOCATION_TAB.QT;
+--      Stock_Tab(V_STOCK_INDEX).ALLOTED_QTY 
+--            := Stock_Tab(V_STOCK_INDEX).Alloted_Qty+ALLOCATION_TAB.QT;
+--      Elsif R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+--        And Stock_Tab(V_STOCK_INDEX).Available_Qty >0 
+--      Then
+--      ALLOCATION_TAB.QTY := CASE WHEN P_QTY > Stock_Tab(V_STOCK_INDEX).Available_Qty 
+--                                  THEN Stock_Tab(V_STOCK_INDEX).Available_Qty
+--                                  ELSE P_QTY
+--                                  END;
+--      
+--      P_QTY := P_QTY-ALLOCATION_TAB.QTY;
+--      
+--      Stock_Tab(V_STOCK_INDEX).Available_Qty 
+--            := Stock_Tab(V_STOCK_INDEXI).Available_Qty-ALLOCATION_TAB.QT;
+--      Stock_Tab(V_STOCK_INDEX).ALLOTED_QTY 
+--            := Stock_Tab(V_STOCK_INDEX).Alloted_Qty+ALLOCATION_TAB.QT;
+--      END IF;
+--      V_SEQ_NO  := V_SEQ_NO+1;
+--      ALLOCATION_TAB.SEQ_NO := V_SEQ_NO;
+--      ALLOCATION_TAB.ALLOCATE_FROM := 'STOCK';
+--      ALLOCATION_TAB.WO_NO := 'STOCK';
+--      ALLOCATION_TAB.LOT_NO := Stock_Tab(V_STOCK_INDEX).LOT_NO;
+--      ALLOCATION_TAB.PO_NO := NULL;
+--      ALLOCATION_TAB.PO_LINE_NO := NULL;
+--    END IF;
+--    V_STOCK_INDEX := P_Item_No||'~'||(I+1);
+--  END LOOP;
+--END IF;
+---- STOCK ALLOCATION, END
+  RETURN 1;
+END SF_ALLOCATE;
+PROCEDURE LP_INSERT_ALLOCATION(P_MRP_ALLCOATION MRP_ALLOCATION_TEMP%ROWTYPE)
+IS
+BEGIN
+  INSERT INTO MRP_ALLOCATION_TEMP VALUES P_MRP_ALLCOATION;
+  COMMIT;
+END;
+
+PROCEDURE SP_PRE_AUDIT
+IS
+V_PRE_AUDIT_FLAG BOOLEAN DEFAULT FALSE;
+BEGIN
+  FOR I IN (
+  SELECT COUNT(1),SALES_ORDER_NO,ORDER_LINE_NO
+  FROM MFG_WO_SALES_ORDERS
+  WHERE PARENT_WORK_ORDER_NO IS NULL
+  GROUP BY SALES_ORDER_NO,ORDER_LINE_NO
+  HAVING COUNT(1) > 1
+  )
+  LOOP
+--    DISPLAY_PF(I.SALES_ORDER_NO||','||I.ORDER_LINE_NO);
+    V_PRE_AUDIT_FLAG := TRUE;
+  END LOOP;
+  IF V_PRE_AUDIT_FLAG THEN 
+    RAISE_APPLICATION_ERROR(-20555,'Above Orders are repeated in MFG_WO_SALES_ORDERS TABLE. ');
+  END IF;
+  V_PRE_AUDIT_FLAG := FALSE;
+FOR I IN  
+(SELECT *
+FROM (    
+select A.WORK_ORDER_NO,A.STEP_ID,a.BOM_TYPE,A.BATCH_SIZE, a.QTY_REQUIRED_PER_CYCLE, 
+a.TOTAL_QTY_REQUIRED,WO_QTY,
+a.QTY_REQUIRED_PER_CYCLE*
+(case when a.BOM_TYPE = 'MP' THEN B.WO_QTY
+      when a.BOM_TYPE = 'MB' THEN CEIL(B.WO_QTY/A.BATCH_SIZE)
+ELSE 1
+END) AS TQRC
+from MFG_WO_BOM a,v_mrp_wo_info b
+where 
+--a.work_order_no = 'MMOB-1'and 
+a.work_order_no = b.work_order_no 
+AND B.WORK_ORDER_STATUS <> 'CL'
+AND A.BOM_TYPE IS NOT NULL
+)
+WHERE ROUND(TOTAL_QTY_REQUIRED) <> ROUND(TQRC)
+)
+LOOP
+--      DISPLAY_PF('WO : '||I.WORK_ORDER_NO||' , STEP ID : '||I.STEP_ID||' , TOTAL QTY : '||I.TQRC||' , BUT SYSTEM STORED AS :'||I.TOTAL_QTY_REQUIRED);
+        V_PRE_AUDIT_FLAG := TRUE;
+END LOOP;
+
+  IF V_PRE_AUDIT_FLAG THEN 
+   -- RAISE_APPLICATION_ERROR(-20555,'Above WO BOM TOTAL REQUIRED QTY VALUE IS WRONG ,PL CHECK AND PROCESS AGAIN.');
+    null;
+    --execute SP_COMPUTE_WO_PRHRS_TOTQTY('1115660-2',100);
+  END IF;
+  
+END SP_PRE_AUDIT;
+
+PROCEDURE SP_MRP_PEGGING(
+                          P_DATE DATE DEFAULT SYSDATE+365 ,
+                          P_USER VARCHAR2 DEFAULT 'OCT' ,
+                          P_Item_No Varchar2 Default Null,
+                          P_CLIET VARCHAR2 DEFAULT 'TEST'
+                        )
+IS
+v_mat_status VARCHAR2(100);
+v_mat_plan_status VARCHAR2(100);
+L_V_INDEX VARCHAR2(150);
+L_V_LOWER_INDEX VARCHAR2(150);
+L_V_WO_INDEX VARCHAR2(150);
+V_ERR VARCHAR2(3500);
+R_MRP MRP_ALLOCATION_TEMP%ROWTYPE;
+
+TYPE WO_STOCK_R IS RECORD(  WO_INDEX MFG_WORK_ORDER.WORK_ORDER_NO%TYPE,
+                               WORK_ORDER_NO MFG_WORK_ORDER.WORK_ORDER_NO%TYPE,
+                               LOT_NO VARCHAR2(100),
+                               WAREHOUSE VARCHAR2(100),
+                               BALANCE_AVAILABLE NUMBER,
+                               ALLOCATED_QTY NUMBER,
+                               AVAILABLE_QTY NUMBER);
+TYPE WO_TYP IS TABLE OF WO_STOCK_R INDEX BY PLS_INTEGER;
+WO_T WO_TYP;
+
+TYPE WO_STOCK_REC IS RECORD( 
+                               WORK_ORDER_NO MFG_WORK_ORDER.WORK_ORDER_NO%TYPE,
+                               LOT_NO VARCHAR2(100),
+                               BALANCE_AVAILABLE NUMBER,
+                               ALLOCATED_QTY NUMBER,
+                               AVAILABLE_QTY NUMBER,
+                               WAREHOUSE VARCHAR2(150));
+TYPE WO_TYPE IS TABLE OF WO_STOCK_REC INDEX BY VARCHAR2(100);
+WO_TAB WO_TYPE;
+V_WO_INDEX  VARCHAR2(100);
+
+-- TO ADD ALLOCATED QTY IN COLLECTIONS
+-- AFTER THAT THIS WILL BE USED IN C_ORDERS_HARD
+CURSOR C_ORDER_LINE
+Is
+Select Order_No||'~'||Line_No||'~'||Order_No||'~'||Line_No As Indx,Order_No,Line_No,
+QTY,QTY AS V_QTY
+FROM MRP_ALLOCATION_TEMP
+WHERE 1=2;
+TYPE WO_LINE_QTY_TYPE IS TABLE OF C_ORDER_LINE%ROWTYPE INDEX BY VARCHAR2(150);
+WO_LINE_QTY_TAB WO_LINE_QTY_TYPE;
+
+TYPE MJ_ALLOCATED_QTY_TYPE IS TABLE OF C_ORDER_LINE%ROWTYPE INDEX BY VARCHAR2(150);
+MJ_ALLOCATED_QTY_TAB MJ_ALLOCATED_QTY_TYPE;
+
+
+-- POPULATING WO BALANCE QTY DEC.
+TYPE T_WO_REC IS RECORD(WORK_ORDER_NO MFG_WORK_ORDER.WORK_ORDER_NO%TYPE,
+                        ITEM_NO MFG_WORK_ORDER.ITEM_NO%TYPE,
+                        ITEM_REVISION_NO MFG_WORK_ORDER.ITEM_REVISION_NO%TYPE,
+                      BALANCE_QTY NUMBER,
+                      WO_RELEASE_DATE DATE);
+TYPE T_WO_TYPE IS TABLE OF T_WO_REC INDEX BY PLS_INTEGER;
+T_WO_TAB T_WO_TYPE;
+
+
+TYPE WO_BAL_REC IS RECORD(ITEM_NO MFG_WORK_ORDER.ITEM_NO%TYPE,
+                          ITEM_REVISION_NO MFG_WORK_ORDER.ITEM_REVISION_NO%TYPE,  
+                          BALANCE_QTY NUMBER,
+                          ALLOCATED_QTY NUMBER,
+                          AVAILABLE_QTY NUMBER,
+                          WO_RELEASE_DATE DATE);
+TYPE WO_BAL_TYPE IS TABLE OF WO_BAL_REC INDEX BY VARCHAR2(100);
+WO_BAL_TAB WO_BAL_TYPE;
+
+-- PREV RUN RECORD NEW
+CURSOR C_PREV_RUN
+IS
+SELECT 
+ALLOCATE_FROM||'~'||ORDER_NO||'~'||LINE_NO||'~'||ROW_NUMBER() OVER(PARTITION BY ORDER_NO,LINE_NO,ALLOCATE_FROM ORDER BY ORDER_NO,LINE_NO) AS PREV_RUN_INDEX,
+SEQ_NO, ORDER_NO,LINE_NO,DUE_DATE,ITEM_NO,
+ITEM_REVISION_NO,QTY,ALLOCATION_TYPE,PEGGING_TYPE,
+WORK_ORDER_NO,LOT_NO,PO_NO,PO_LINE_NO,
+PARENT_SEQ_NO,SO_WO_LINK,ORDER_SOFT_OR_HARD,PEGGING_WITHIN_LEAD_TIME,
+ALLOCATE_FROM,0 ALLOCATED_QTY,QTY AS AVAILABLE_QTY,parent_order_no,parent_order_line_no
+  FROM MRP_ALLOCATION_PREV_RUN;
+
+TYPE PREV_RUN_TYPE_T IS TABLE OF C_PREV_RUN%ROWTYPE INDEX BY PLS_INTEGER;
+PREV_RUN_TAB_T PREV_RUN_TYPE_T;
+TYPE PREV_RUN_TYPE IS TABLE OF C_PREV_RUN%ROWTYPE INDEX BY VARCHAR2(150);
+PREV_RUN_TAB PREV_RUN_TYPE;
+
+
+-- STOCK RECORD 
+
+CURSOR C_STOCK
+IS
+SELECT ITEM_NO||'~'||ROW_NUMBER() OVER(PARTITION BY ITEM_NO ORDER BY ITEM_NO,REV_NO,LOT_NO) AS STOCK_INDEX,
+ITEM_NO ,REV_NO ,LOT_NO ,
+       NULL SERIAL_NO ,NULL WORK_ORDER_NO ,NULL STEP_ID ,
+       NULL LOW_LEVEL_CODE ,NULL LOCATION_NO ,NULL TRANSACTION_DATE , 
+       SUM(BALANCE_AVAILABLE) BALANCE_AVAILABLE , 
+       SUM(INVENTORY_UOM_BALANCE_QTY) INVENTORY_UOM_BALANCE_QTY ,
+       0 ALLOTED_QTY ,
+       SUM(BALANCE_AVAILABLE) AVAILABLE_QTY,WAREHOUSE
+FROM V_INVENTORY_OHQTY_PEGG V_INVENTORY_OHQTY
+GROUP BY ITEM_NO, REV_NO, LOT_NO,WAREHOUSE
+HAVING SUM(BALANCE_AVAILABLE)	 > 0;
+
+TYPE STOCK_TYPE_T IS TABLE OF C_STOCK%ROWTYPE INDEX BY PLS_INTEGER;
+STOCK_TAB_T STOCK_TYPE_T;
+TYPE STOCK_TYPE IS TABLE OF C_STOCK%ROWTYPE INDEX BY VARCHAR2(150);
+STOCK_TAB STOCK_TYPE;
+
+
+-- ITEM_WO_BAL START
+CURSOR C_ITEM_WO_BAL
+IS
+  SELECT ITEM_NO
+  ||'~'
+  ||ROW_NUMBER() OVER(PARTITION BY ITEM_NO ORDER BY ENTRY_DATE,WORK_ORDER_NO)
+  ITEM_WO_INDEX ,
+  WORK_ORDER_NO ,
+  REQ_DATE,
+  ITEM_NO ,
+  ITEM_REVISION_NO ,
+  PARENT_WORK_ORDER_NO,
+  BALANCE_QTY ,
+  0 ALLOCATED_QTY ,
+  BALANCE_QTY AVAILABLE_QTY,WAREHOUSE,WO_RELEASE_DATE
+  FROM (
+  SELECT DISTINCT V.WORK_ORDER_NO,NVL(V.REQUIRED_DATE,NVL(V.SCHEDULED_START_DATE,V.ENTRY_DATE)) REQ_DATE,
+  V.ITEM_NO,V.ITEM_REVISION_NO,V.ENTRY_DATE ENTRY_DATE,V.WAREHOUSE,
+  V.PARENT_WORK_ORDER_NO,V.BALANCE_QTY_NEW-NVL(INTACT_PCWO.PWO_BQTY,0)-NVL(A.QTY,0) AS BALANCE_QTY,V.RELEASE_DATE WO_RELEASE_DATE
+  FROM V_MRP_WO_INFO V,(SELECT SUM(QTY) QTY,WORK_ORDER_NO
+                        FROM MRP_ALLOCATION_TEMP 
+                        WHERE ALLOCATE_FROM = 'WO'
+                        GROUP BY WORK_ORDER_NO
+                        ) A,
+                        (
+                          SELECT 
+                          DISTINCT C.WORK_ORDER_NO CWO,P.WORK_ORDER_NO PWO,C.BALANCE_QTY_NEW CWO_BQTY,
+                          P.BALANCE_QTY_NEW PWO_BQTY,
+                          C.WAREHOUSE
+                            FROM 
+                            V_MRP_WO_INFO P,
+                            V_MRP_WO_INFO  C
+                            WHERE C.PARENT_WORK_ORDER_NO = P.WORK_ORDER_NO
+                              AND R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'Y'
+                        ) INTACT_PCWO
+  WHERE V.Work_Order_Status In ('OR','ON','OE')
+  AND V.WORK_ORDER_NO = A.WORK_ORDER_NO(+)
+  AND V.DO_NOT_INCLUDE_IN_PLANNING = 'N'
+  AND V.BALANCE_QTY > 0
+  AND V.WORK_ORDER_NO = INTACT_PCWO.CWO(+)
+  --AND V.WAREHOUSE = INTACT_PCWO.WAREHOUSE(+)
+  /*AND V.BALANCE_QTY-NVL(A.QTY(+),0)> 0*/
+  --AND V.BALANCE_QTY-NVL(A.QTY,0)> 0
+  AND V.BALANCE_QTY_NEW-NVL(INTACT_PCWO.PWO_BQTY,0)-NVL(A.QTY,0) > 0
+  );
+
+TYPE ITEM_WO_BAL_TYPE_T IS TABLE OF C_ITEM_WO_BAL%ROWTYPE INDEX BY PLS_INTEGER;
+ITEM_WO_BAL_TAB_T ITEM_WO_BAL_TYPE_T;
+
+TYPE ITEM_WO_BAL_TYPE IS TABLE OF C_ITEM_WO_BAL%ROWTYPE INDEX BY VARCHAR2(150);
+ITEM_WO_BAL_TAB ITEM_WO_BAL_TYPE;
+
+-- ITEM_WO_BAL END
+--
+-- STRAT 
+CURSOR C1 
+IS 
+  SELECT 
+  P.WORK_ORDER_NO||'~'||ROW_NUMBER() OVER(PARTITION BY P.WORK_ORDER_NO ORDER BY C.ENTRY_DATE,C.WORK_ORDER_NO) PCINDX ,
+  C.WORK_ORDER_NO CWO,P.WORK_ORDER_NO PWO,C.BALANCE_QTY_NEW-NVL(AT.QTY,0) CWO_BQTY,
+  P.BALANCE_QTY_NEW PWO_BQTY,C.BALANCE_QTY_NEW-NVL(AT.QTY,0) AVAILABLE_QTY,C.ITEM_NO CITEM_NO,C.RELEASE_DATE WO_RELEASE_DATE,
+  C.WAREHOUSE
+    FROM 
+    V_MRP_WO_INFO P,
+    V_MRP_WO_INFO  C,
+    (SELECT SUM(QTY) QTY,WORK_ORDER_NO
+                        FROM MRP_ALLOCATION_TEMP 
+                        WHERE ALLOCATE_FROM = 'WO'
+                        GROUP BY WORK_ORDER_NO
+                        ) AT
+    WHERE C.PARENT_WORK_ORDER_NO = P.WORK_ORDER_NO
+    AND C.WORK_ORDER_NO = AT.WORK_ORDER_NO(+)
+    AND C.BALANCE_QTY_NEW-NVL(AT.QTY,0) > 0;
+    
+
+TYPE TYP_PC_WO_BAL IS TABLE OF C1%ROWTYPE INDEX BY PLS_INTEGER;--VARCHAR2(150);
+TAB_PC_WO_BAL TYP_PC_WO_BAL;
+
+TYPE T_PC_WO_BAL IS TABLE OF C1%ROWTYPE INDEX BY VARCHAR2(150);
+TAB1_PC_WO_BAL T_PC_WO_BAL;
+-- END
+-- ITEM_PO_BAL START 
+CURSOR C_ITEM_PO_BAL
+IS
+SELECT A.ITEM_NO||'~'||ROW_NUMBER() OVER(PARTITION BY A.ITEM_NO ORDER BY A.WORK_ORDER_NO  ,nvl(a.PROMISED_DATE,a.EXPECTED_DATE),A.PO_NO,A.Line_No) AS ITEM_PO_INDEX,
+      A.Po_No,A.Line_No,nvl(a.PROMISED_DATE,a.EXPECTED_DATE) As Due_Date,A.Item_No,A.Item_Revision_No As Item_Revision_No,
+      NVL(C.BALANCE_QTY_BUOM,A.QTY_BASE_UOM)-NVL(AT.QTY,0) AS BALANCE_QTY,
+      b.VENDOR_NO,a.work_order_no work_order_no,
+      0 ALLOCATED_QTY ,
+       BALANCE_QTY-NVL(AT.QTY,0) AVAILABLE_QTY,
+      B.WAREHOUSE_NUMBER WAREHOUSE
+  from 
+  PO_LINE a,
+  PO_HEADER B,
+  V_BALANCE_PO_TO_RECEIVE C ,
+  (SELECT PO_NO,PO_LINE_NO,SUM(QTY) QTY FROM MRP_ALLOCATION_TEMP 
+  WHERE ALLOCATE_FROM = 'PO'
+  GROUP BY PO_NO,PO_LINE_NO  ) AT
+ where NVL(C.BALANCE_QTY_BUOM,a.QTY_BASE_UOM) > 0
+   and a.PO_NO = B.PO_NO
+   and a.PO_NO = C.PO_NO
+   And A.Line_No = C.Line_No
+   and B.STATUS in ('Open','Pending Approval')
+   And A.Po_Line_Type <> 'OP'
+   and a.LINE_NO      <> 0   
+   AND A.PO_NO = AT.PO_NO(+)
+   And A.Line_No = AT.PO_Line_No(+);
+
+
+TYPE ITEM_PO_BAL_TYPE_T IS TABLE OF C_ITEM_PO_BAL%ROWTYPE INDEX BY PLS_INTEGER;
+ITEM_PO_BAL_TAB_T ITEM_PO_BAL_TYPE_T;
+
+TYPE ITEM_PO_BAL_TYPE IS TABLE OF C_ITEM_PO_BAL%ROWTYPE INDEX BY VARCHAR2(150);
+ITEM_PO_BAL_TAB ITEM_PO_BAL_TYPE;
+
+-- 1 START 
+CURSOR C_PO
+IS
+SELECT A.Po_No||'~'||A.Line_No PO_INDEX,
+      A.Po_No,A.Line_No,B.VENDOR_NO,
+      0 ALLOCATED_QTY ,
+      BALANCE_QTY AVAILABLE_QTY
+  from 
+  PO_LINE a,
+  PO_HEADER B,
+  V_BALANCE_PO_TO_RECEIVE C 
+ where NVL(C.BALANCE_QTY_BUOM,a.QTY_BASE_UOM) > 0
+   and a.PO_NO = B.PO_NO
+   and a.PO_NO = C.PO_NO
+   And A.Line_No = C.Line_No
+   and B.STATUS in ('Open','Pending Approval')
+   And A.Po_Line_Type <> 'OP'
+   and a.LINE_NO      <> 0
+   AND BALANCE_QTY >0 ;
+   
+TYPE PO_BAL_TYP1 IS TABLE OF C_PO%ROWTYPE INDEX BY PLS_INTEGER;
+PO_BAL_TAB1 PO_BAL_TYP1;
+
+TYPE PO_BAL_TYP IS TABLE OF C_PO%ROWTYPE INDEX BY VARCHAR2(150);
+PO_BAL_TAB PO_BAL_TYP;
+
+-- 1 END 
+
+-- ITEM_PO_BAL_END
+
+
+--TYPE T_STOCK_TYPE IS TABLE OF G_MRP_STOCK%ROWTYPE INDEX BY PLS_INTEGER;
+--T_STOCK_TAB T_STOCK_TYPE;
+--TYPE STOCK_TYPE IS TABLE OF G_MRP_STOCK%ROWTYPE INDEX BY VARCHAR2(150);
+--STOCK_TAB STOCK_TYPE;
+-- WO SCRAP CURSOR, START
+CURSOR C_SCRAP_ALLOCATION
+is 
+SELECT distinct  WO.WORK_ORDER_NO||'_QC_ALLW' AS ORDER_NO, 1 LINE_NO,     to_date('01-JAN-2001','DD-MON-YYYY') DUE_DATE,
+       LEAST(STD_SCRAP_QTY,BALANCE_QTY_NEW) AS SCRAP_QTY , WO.work_order_no,     WO.item_no,
+      WO.ITEM_REVISION_NO,  P_USER,     V_SYSDATE,
+      'S' AS PEGGING_TYPE ,   'SO_WO' AS ALLOCATION_TYPE,
+      '0' AS LEVEL_CODE , '0000000000' HIERARCHY_LEVEL,WORK_ORDER_NO||'_QC_ALLW' PARENT_ORDER_NO,
+      1 AS parent_order_line_no,WAREHOUSE,RELEASE_DATE AS WO_RELEASE_DATE
+FROM V_MRP_WO_INFO WO
+JOIN IM_ITEMS IM
+ON (WO.ITEM_NO = IM.ITEM_NO)
+WHERE IM.INCLUDE_MRP ='Y'
+  AND NVL(IM.INACTIVE,'N') = 'N'
+  AND WO.WORK_ORDER_TYPE <> 'WIP_REWORK'
+  AND WO.WORK_ORDER_STATUS IN ('OR','ON','OE')
+  AND WO.PARENT_WORK_ORDER_NO IS NULL
+  AND NVL(WO.DO_NOT_INCLUDE_IN_PLANNING,'N')='N' 
+  AND LEAST(WO.STD_SCRAP_QTY,BALANCE_QTY_NEW) > 0
+  ORDER BY WORK_ORDER_NO;
+  
+TYPE WO_SCRAP_TYPE IS TABLE OF C_SCRAP_ALLOCATION%ROWTYPE INDEX BY PLS_INTEGER;
+WO_SCRAP_TAB WO_SCRAP_TYPE;
+-- WO SCRAP CURSOR, END
+
+-- WO ISSED, START
+CURSOR C_WO_ISSUED
+IS
+SELECT * 
+/*FROM V_MRP_WO_BOM_BALANCE_QTY*/
+FROM v_wo_bom_balance_qty_mmd
+WHERE BALANCE_IN_ISSUED_QTY > 0;
+
+TYPE WO_ISSUED_TYPE_T IS TABLE OF C_WO_ISSUED%ROWTYPE INDEX BY PLS_INTEGER;
+WO_ISSUED_TAB_T WO_ISSUED_TYPE_T;
+
+TYPE WO_ISSUED_TYPE IS TABLE OF C_WO_ISSUED%ROWTYPE INDEX BY VARCHAR2(150);
+WO_ISSUED_TAB WO_ISSUED_TYPE;
+
+-- WO ISSED, END
+CURSOR C_BOM_BAL_QTY
+IS
+SELECT WORK_ORDER_NO||'~'||STEP_ID||'~'||ITEM_NO BOM_INDX,(BALANCE_IN_ISSUED_QTY+ REQ_QTY) QTY
+  FROM V_WO_BOM_BALANCE_QTY_MMD;
+--  WHERE BALANCE_IN_ISSUED_QTY > 0 OR REQ_QTY > 0;
+  
+  TYPE TYP_BOM_BAL_QTY IS TABLE OF C_BOM_BAL_QTY%ROWTYPE INDEX BY VARCHAR2(250);
+  TAB_BOM_BAL_QTY TYP_BOM_BAL_QTY;
+
+
+-- HARD ORDER 
+CURSOR C_ORDERS_HARD(C_ITEM_NO IM_ITEMS.ITEM_NO%TYPE)
+IS
+SELECT 
+  SD.ORDER_NO ,
+  SD.LINE_NO ,
+  SD.ITEM_NO,
+  SD.ITEM_REVISION_NO,
+--  SOB.BALANCE_QTY_BASE_UOM AS DEMAND_QTY,
+  CASE WHEN SW.WORK_ORDER_NO IS NULL 
+       THEN SOB.BALANCE_QTY_BASE_UOM 
+       ELSE LEAST(NVL(SOB.BALANCE_QTY_BASE_UOM,9999),SW.QTY)
+       END AS DEMAND_QTY,
+       SOB.BALANCE_QTY_BASE_UOM - 
+   (CASE WHEN SW.WORK_ORDER_NO IS NULL 
+       THEN SOB.BALANCE_QTY_BASE_UOM 
+       ELSE LEAST(NVL(SOB.BALANCE_QTY_BASE_UOM,9999),SW.QTY)
+       END) AS MAIN_QTY,       
+--  SW.QTY AS DEMAND_QTY,
+  SD.DUE_DATE ,
+  SW.WORK_ORDER_NO,
+  'SO_WO' AS ALLOCATION_TYPE,
+  CASE WHEN SW.WORK_ORDER_NO IS NULL THEN 'N' ELSE 'Y' END SO_WO_LINK,
+  Case When Sd.Due_Date <= R_App_Settings.Hard_Pegging_Window_Days+V_Sysdate And R_App_Settings.Hard_Pegging_Window_Days <> 0 Then 'Y' Else 'N' End As With_In_Window_Days,
+  Nvl(Sh.Allocation_Type,'S') As Order_Soft_Or_Hard,
+  Null As Parent_Seq_No,
+  Null As Parent_Pegging_Type,
+  Null As Parent_Order_No,
+  null as parent_order_line_no,
+  SD.ITEM_NO as parent_item_no,
+  NULL AS PARENT_WORK_ORDER_NO,
+  NULL AS FINAL_WORK_ORDER_NO,
+  NULL LEVEL_CODE, 
+  NULL HIERARCHY_LEVEL,
+  NVL(SD.SHIP_FROM,SF_GET_DEFAULT_BUC) WAREHOUSE
+FROM 
+  SD_ORDER_HEADER SH
+    JOIN SD_ORDER_DETAIL SD
+      ON SD.ORDER_NO = SH.ORDER_NO
+        JOIN V_MRP_SO_PACKING_SLIP_DETAILS SOB
+          ON (SD.ORDER_NO = SOB.ORDER_NO
+              and sd.line_no = sob.line_no)
+               LEFT OUTER JOIN MFG_WO_SALES_ORDERS SW
+              ON (SW.SALES_ORDER_NO = SOB.ORDER_NO
+                  AND SW.ORDER_LINE_NO = SOB.LINE_NO)
+                JOIN IM_ITEMS IM
+                  ON (SD.ITEM_NO = IM.ITEM_NO)
+WHERE SH.STATUS = 'Open'
+  AND SOB.BALANCE_QTY_BASE_UOM > 0
+  AND (
+      SW.WORK_ORDER_NO IS NOT NULL 
+      OR
+      (SD.DUE_DATE <= R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS+V_SYSDATE AND R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS <> 0) 
+      OR 
+      NVL(SH.ALLOCATION_TYPE,'S') = 'H'
+    )
+  AND SD.ORDER_DOC_TYPE NOT IN ('S','E')
+  AND SW.PARENT_WORK_ORDER_NO IS NULL
+  AND IM.ITEM_NO = C_ITEM_NO
+UNION ALL
+SELECT 
+  ATR.WORK_ORDER_NO ORDER_NO ,
+  WB.STEP_ID LINE_NO ,
+  WB.ITEM_NO,
+  WB.ITEM_REVISION_NO,
+--  PKG_MRP.SF_BOM_REQ_QTY(ATR.WORK_ORDER_NO,WB.STEP_ID,WB.ITEM_NO,ATR.QTY) AS DEMAND_QTY,
+ LEAST(QTY_REQUIRED_PER_CYCLE*(CASE BOM_TYPE WHEN 'MP' THEN QTY
+                                      WHEN 'MB' THEN QTY/wb.BATCH_SIZE
+                                      ELSE 1
+                                      END ),(NVL(WB.REQ_QTY,0)+NVL(WB.BALANCE_IN_ISSUED_QTY,0))) AS DEMAND_QTY,
+  0 AS MAIN_QTY,
+--  nvl(SF_GET_LEADTIME_BS(ATR.WORK_ORDER_NO,ATR.DUE_DATE),ATR.DUE_DATE),
+--  ATR.DUE_DATE AS DUE_DATE,
+  WORKING_DATE_FROM_DATE(TRUNC(ATR.DUE_DATE),DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',-NVL(PROCESSING_DAYS,0),-NVL(IM.MRP_LEAD_TIME,0))) AS DUE_DATE,
+  NULL AS WORK_ORDER_NO,
+  'WO_CO' AS ALLOCATION_TYPE,
+  ATR.SO_WO_LINK,
+  ATR.PEGGING_WITHIN_LEAD_TIME,
+  Atr.Order_Soft_Or_Hard,
+  Atr.Seq_No As Parent_Seq_No,
+  Pegging_Type As Parent_Pegging_Type,
+  NVL(ATR.Parent_Order_No,atr.order_no) As Parent_Order_No,
+  NVL(ATR.parent_order_line_no,atr.line_no) as parent_order_line_no,
+  NVL(atr.PARENT_ITEM_NO,atr.ITEM_NO) as parent_item_no,
+  ATR.WORK_ORDER_NO AS PARENT_WORK_ORDER_NO,
+  NVL(ATR.FINAL_WORK_ORDER_NO,ATR.WORK_ORDER_NO) AS FINAL_WORK_ORDER_NO,
+  ATR.LEVEL_CODE LEVEL_CODE,
+  ATR.HIERARCHY_LEVEL HIERARCHY_LEVEL,
+  ATR.WAREHOUSE
+FROM MRP_ALLOCATION_TEMP ATR
+     JOIN V_WO_BOM_BALANCE_QTY_MMD WB--MFG_WO_BOM WB
+    ON( ATR.WORK_ORDER_NO = WB.WORK_ORDER_NO)
+    join im_items im
+    on (wb.item_no = im.item_no)
+    join mfg_work_order wo
+    on (wb.WORK_ORDER_NO = wo.WORK_ORDER_NO)
+WHERE WB.ITEM_NO = C_ITEM_NO
+  AND ATR.ALLOCATE_FROM = 'WO'
+ORDER BY DUE_DATE;
+
+-- DEMAND CURSOR, START
+V_START_FORCAST_AFTER     NUMBER DEFAULT 10;
+
+CURSOR C_DEMAND(C_ITEM_NO VARCHAR2)
+IS
+SELECT * FROM (
+ SELECT 
+  1000000 AS SORT_ORDER,
+  SD.ORDER_NO,
+  SD.LINE_NO,
+  SD.DUE_DATE,
+  SD.ITEM_NO,
+  SD.ITEM_REVISION_NO,
+  C.BALANCE_QTY_BASE_UOM-NVL(D.ALLOCATED_QTY,0)
+                AS BALANCE_QTY_BASE_UOM,
+  NULL AS RELEASE_DATE,
+  SD.ORDER_NO as PARENT_ORDER_NO,
+  SD.LINE_NO as  PARENT_ORDER_LINE_NO ,
+  NULL as final_work_order_no,
+  null as level_code,
+  null as hierarchy_level,
+  'SO_WO' allocation_type,
+  NULL AS BOM_TYPE,
+  0 AS ISSUED_QTY,
+  SD.ORDER_PRIORITY_CODE PRIORITY_CODE,
+  NULL AS PO_NO,
+  NULL AS PO_LINE_NO,
+  NULL AS WORK_ORDER_NO,
+  NULL VENDOR_NO,
+  SD.DUE_DATE PARENT_ORDER_DUE_DATE,
+  SD.ORDER_NO PARENT_ORDER_NO_DUE_DATE,
+  SD.LINE_NO PARENT_ORDER_Line_no_DUE_DATE,         
+--  Sf_is_within_window_days(SD.ORDER_NO, SD.LINE_NO, SD.DUE_DATE,'SO', 
+--      (CASE WHEN R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS_TYPE <> 'M' THEN
+--      nvl(SD.PROCESSING_DAYS,0)
+--      ELSE
+--       R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS
+--      END)  
+--      ) Pegging_Within_Lead_Time,
+    CASE
+    WHEN (TRUNC(SD.due_date) <= TRUNC(sysdate)+ R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS AND NVL(R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS,0) <>0 ) THEN
+      'Y'
+    ELSE
+      'N'
+    END Pegging_Within_Lead_Time,      
+      null seq_no,
+      NVL(SH.ALLOCATION_TYPE,'S') PARENT_PEGGING_TYPE,
+      Null As Parent_Seq_No,
+      NULL AS PARENT_WORK_ORDER_NO,
+      SD.ITEM_NO AS PARENT_ITEM_NO,
+      NVL(SD.SHIP_FROM,V_BUC) WAREHOUSE
+  FROM 
+  SD_ORDER_DETAIL SD,
+  SD_ORDER_HEADER SH,
+   V_MRP_SO_PACKING_SLIP_DETAILS c,
+--  V_ORDER_PACKING_SLIP_DETAILS C,
+     (select sum(qty) allocated_qty , order_no , line_no from MRP_ALLOCATION_TEMP
+   WHERE NVL(WORK_ORDER_NO,PO_NO) <> 'NO-PLAN' 
+   and ITEM_no = C_ITEM_NO
+   group by order_no , line_no) d,
+   IM_ITEMS I
+ WHERE SD.ITEM_no = C_ITEM_NO
+ and SD.ITEM_no = i.ITEM_no
+   AND C.BALANCE_QTY_BASE_UOM-nvl(d.allocated_qty,0) >0
+  AND (
+        (R_APP_SETTINGS.IM_LEAD_TIME='C' AND SD.DUE_DATE <= nvl(SD.PROCESSING_DAYS,0) + P_DATE)
+        OR 
+        (R_APP_SETTINGS.IM_LEAD_TIME <> 'C' AND  SD.DUE_DATE <= NVL(I.CUM_MRP_LEAD_TIME,0)+ P_DATE)
+      )
+   AND SD.ORDER_DOC_TYPE NOT IN ('S','E')
+   AND SD.order_no = SH.order_no
+   AND SH.STATUS = 'Open'
+   AND SD.ORDER_NO = C.ORDER_NO(+)
+   AND SD.LINE_NO = C.LINE_NO(+)
+   AND SD.LINE_NO <> 0
+   AND SD.ORDER_NO = D.ORDER_NO(+)
+   AND SD.LINE_NO = D.LINE_NO(+)
+   UNION ALL
+   --SAFETY STOCK
+SELECT 
+	1000000 as SORT_ORDER,
+	'SAFETY STOCK' ORDER_NO,
+	1 AS LINE_NO,
+	sysdate DUE_DATE,
+	IM.ITEM_NO,
+	IM.CURRENT_REVISION_NO ITEM_REVISION_NO,
+	NVL(IL.SAFETY_STOCK,IM.SAFETY_STOCK)-NVL(INV.ALLOCATED_QTY,0) AS BALANCE_QTY_BASE_UOM,
+	NULL AS RELEASE_DATE,
+	null as PARENT_ORDER_NO,
+	null PARENT_ORDER_LINE_NO ,
+	NULL as final_work_order_no,
+	null as level_code,
+	null as hierarchy_level,
+	'SO_WO' allocation_type,
+	NULL AS BOM_TYPE,
+	0 AS ISSUED_QTY,
+	100 PRIORITY_CODE,
+	null,
+	null,
+	null,
+	NULL VENDOR_NO,
+	sysdate PARENT_ORDER_DUE_DATE,
+	null PARENT_ORDER_no_DUE_DATE,
+	null PARENT_ORDER_Line_no_DUE_DATE,         
+	'N' As Pegging_Within_Lead_Time,
+	null seq_no,
+	null PARENT_PEGGING_TYPE,
+  Null As Parent_Seq_No,  
+  NULL AS PARENT_WORK_ORDER_NO,  
+  IM.ITEM_NO AS PARENT_ITEM_NO,
+  NVL(NVL(IL.WAREHOUSE_NUMBER,IW.WAREHOUSE),V_BUC) WAREHOUSE
+FROM IM_ITEMS IM
+LEFT OUTER JOIN IM_LOCATIONS IW
+ON IW.LOCATION_CODE = IM.DEFAULT_LOCATION_NO
+LEFT OUTER JOIN IM_ITEM_LOCATIONS IL 
+ON IM.ITEM_NO = IL.ITEM_NO
+LEFT OUTER JOIN
+	(
+    SELECT SUM(qty) allocated_qty ,
+    WAREHOUSE ,    ITEM_no
+    FROM INV_ALLOCATION_TMP
+    WHERE ITEM_no  =  C_ITEM_no
+    AND NVL(WORK_ORDER_NO,PO_NO) <> 'NO-PLAN'
+    AND order_no  ='SAFETY STOCK'
+    GROUP BY WAREHOUSE ,ITEM_NO
+  ) INV
+ON IM.ITEM_NO = INV.ITEM_NO  
+ AND NVL(NVL(IL.WAREHOUSE_NUMBER,IW.WAREHOUSE),V_BUC) = INV.WAREHOUSE
+WHERE IM.ITEM_NO = C_ITEM_NO
+AND NVL(IL.SAFETY_STOCK,IM.SAFETY_STOCK)-NVL(INV.ALLOCATED_QTY,0) > 0
+AND Nvl(IM.Inactive,'N')='N'
+UNION ALL
+--ROP
+   SELECT 
+    1000000 as SORT_ORDER,
+    'ROP-'||IM.ITEM_NO ORDER_NO,
+    1 AS LINE_NO, 
+    v_sysdate+nvl(IM.cum_mrp_lead_time,0) DUE_DATE,        
+    IM.ITEM_NO,
+    IM.CURRENT_REVISION_NO ITEM_REVISION_NO,   
+    NVL(NVL(IL.REORDER_POINT,IM.REORDER_POINT),0) AS BALANCE_QTY_BASE_UOM,   
+    NULL AS RELEASE_DATE,   
+    null as parent_order_no,
+    null parent_order_line_no ,   
+    null as final_work_order_no,
+    NULL as level_code,   
+    NULL AS HIERARCHY_LEVEL,
+    'SO_WO' ALLOCATION_TYPE,   
+    NULL AS BOM_TYPE,
+    0 AS ISSUED_QTY,
+    100 PRIORITY_CODE,     
+    NULL			,
+    NULL			,
+    NULL			,
+    NULL VENDOR_NO	,      
+    NULL PARENT_ORDER_DUE_DATE,
+    null PARENT_ORDER_NO_DUE_DATE,
+    null PARENT_ORDER_LINE_NO_DUE_DATE,         
+    'N' As Pegging_Within_Lead_Time,
+    null seq_no           ,
+    null PARENT_PEGGING_TYPE ,
+    Null As Parent_Seq_No,  
+    NULL AS PARENT_WORK_ORDER_NO,  
+    IM.ITEM_NO AS PARENT_ITEM_NO,
+    NVL(NVL(IL.WAREHOUSE_NUMBER,IW.WAREHOUSE),V_BUC) WAREHOUSE
+  FROM IM_ITEMS IM
+  LEFT OUTER JOIN IM_LOCATIONS IW
+  ON IW.LOCATION_CODE = IM.DEFAULT_LOCATION_NO
+  LEFT OUTER JOIN IM_ITEM_LOCATIONS IL 
+  ON IM.ITEM_NO = IL.ITEM_NO
+  WHERE IM.ITEM_NO = C_ITEM_NO   
+  AND NVL(IL.REORDER_POINT,IM.REORDER_POINT) > 0
+  AND Nvl(IM.Inactive,'N')='N'
+  AND R_APP_SETTINGS.REORDER_POINT_FLG = 'Y'
+ UNION ALL
+ -- QUOTATION
+ SELECT 
+	1000000 AS SORT_ORDER,
+	'QT-'||A.QUOTATION_NO AS ORDER_NO,
+	A.LINE_NO,      
+	NVL(B.DUE_DATE,	nvl(A.DUE_DATE,	V_SYSDATE+nvl(F.CUM_MRP_LEAD_TIME,0))),
+	A.ITEM_NO	,
+	a.ITEM_REVISION_NO	,      
+	QUOTE_QTY_BASE_UOM - NVL(B.QTY,0)  AS BALANCE_QTY_BASE_UOM,      
+	null AS RELEASE_DATE,      
+	'QT-'||A.QUOTATION_NO as parent_order_no,      
+	A.LINE_NO parent_order_line_no ,      
+	null as final_work_order_no,      
+	null as level_code,      
+	null as hierarchy_level,
+	'QT_WO' allocation_type,      
+	NULL AS BOM_TYPE,
+	0 AS ISSUED_QTY,
+	100 PRIORITY_CODE,      
+	null			,
+	null			,
+	null			,
+	NULL VENDOR_NO	,      
+	A.DUE_DATE PARENT_ORDER_DUE_DATE,
+	a.QUOTATION_NO PARENT_ORDER_no_DUE_DATE,
+	a.LINE_NO PARENT_ORDER_Line_no_DUE_DATE ,
+	'N' Pegging_Within_Lead_Time,
+	null seq_no          ,
+	null PARENT_PEGGING_TYPE,
+  Null As Parent_Seq_No,   
+  NULL AS PARENT_WORK_ORDER_NO,  
+  A.ITEM_NO AS PARENT_ITEM_NO,
+  V_BUC AS WAREHOUSE
+FROM SD_QUOTATION_DETAIL A,      
+(SELECT SUM(QTY) AS QTY,MAX(DUE_DATE) DUE_DATE,ORDER_NO,LINE_NO FROM INV_ALLOCATION_HISTORY GROUP BY ORDER_NO,LINE_NO) B,      
+(select sum(qty) allocated_qty , order_no , line_no from MRP_ALLOCATION_TEMP group by order_no , line_no) d,      
+sd_quotation_header e,      
+im_items f      
+WHERE a.ITEM_no = C_ITEM_NO      
+AND 'QT-'||A.QUOTATION_NO = B.ORDER_NO(+)      
+AND A.LINE_NO = B.LINE_NO(+)      
+and 'QT-'||a.QUOTATION_NO = d.order_no(+)      
+and a.line_no = d.line_no(+)      
+and a.quotation_no = e.quotation_no      
+and e.holds_till is not null      
+and e.holds_till >= v_sysdate-7      
+and pkg_status.Sf_Check_Status('SD_QUOTATION_HEADER',A.QUOTATION_NO,NULL,NULL,NULL,NULL,NULL) not in ('Lost','Won')      
+AND QUOTE_QTY_BASE_UOM - nvl(B.qty,0) > 0      
+AND A.ITEM_NO = F.ITEM_NO      
+--and SF_GET_PEGGING_TYPE(E.CUSTOMER_NO,NULL,'Q')='H'
+AND NVL(E.ALLOCATION_TYPE ,'S') = 'H'
+UNION ALL
+SELECT 
+  1000000 AS SORT_ORDER,
+  D.ITEM_NO AS ORDER_NO,
+  A.STEP_ID AS LINE_NO, 
+  NVL(TRUNC(D.DUE_DATE),V_SYSDATE) AS DUE_DATE,
+  A.ITEM_NO AS ITEM_NO,
+  A.ITEM_REVISION_NO,
+  (A.QTY_REQUIRED_PER_CYCLE)*DECODE(A.BOM_TYPE,'MP',D.QTY,'MB',D.QTY/NVL(A.BATCH_SIZE,1),1) AS BALANCE_QTY_BASE_UOM,
+  NULL,
+  NVL(D.PARENT_ORDER_NO,D.ORDER_NO) AS PARENT_ORDER_NO,
+  NVL(D.PARENT_ORDER_LINE_NO,D.LINE_NO) AS PARENT_ORDER_LINE_NO,
+  NULL AS FINAL_WORK_ORDER_NO,
+  D.LEVEL_CODE,
+  D.HIERARCHY_LEVEL,
+  'QT_CO' AS ALLOCATION_TYPE,
+  NULL AS BOM_TYPE,
+  0 AS ISSUED_QTY,
+  100 PRIORITY_CODE,
+  NULL, NULL, NULL,NULL VENDOR_NO,
+  D.DUE_DATE PARENT_ORDER_DUE_DATE,
+  D.ORDER_NO PARENT_ORDER_NO_DUE_DATE,
+  D.LINE_NO PARENT_ORDER_LINE_NO_DUE_DATE,
+  D.PEGGING_WITHIN_LEAD_TIME,
+  D.SEQ_NO SEQ_NO ,
+  D.PARENT_PEGGING_TYPE PARENT_PEGGING_TYPE,
+  D.SEQ_NO AS PARENT_SEQ_NO,
+  D.PARENT_WORK_ORDER_NO AS PARENT_WORK_ORDER_NO,
+  D.PARENT_ITEM_NO  AS PARENT_ITEM_NO ,
+  V_BUC AS WAREHOUSE
+FROM SD_ESTIMATE_BOM A, MRP_ALLOCATION_TEMP  D,SD_QUOTATION_DETAIL QD
+WHERE A.ITEM_NO = C_ITEM_NO
+AND   D.WORK_ORDER_NO = 'NO-PLAN'
+AND   D.ALLOCATION_TYPE  = 'QT_WO'
+AND A.QUOTATION_NO = SUBSTR(D.ORDER_NO,4)
+AND A.QUOTATION_NO = QD.QUOTATION_NO
+AND QD.CONFIGURATOR_ID IS NULL 
+UNION ALL
+SELECT 
+  1000000 AS SORT_ORDER,
+  D.ITEM_NO AS ORDER_NO,
+  A.LINE_NO AS LINE_NO, 
+  NVL(TRUNC(D.DUE_DATE),V_SYSDATE) AS DUE_DATE,
+  A.ITEM_NO AS ITEM_NO,
+  A.ITEM_REVISION_NO,
+  (A.QTY_REQUIRED_PER_CYCLE)*DECODE(A.BOM_TYPE,'MP',D.QTY,'MB',D.QTY/NVL(A.BATCH_SIZE,1),1) AS BALANCE_QTY_BASE_UOM,
+  NULL,
+  NVL(D.PARENT_ORDER_NO,D.ORDER_NO) AS PARENT_ORDER_NO,
+  NVL(D.PARENT_ORDER_LINE_NO,D.LINE_NO) AS PARENT_ORDER_LINE_NO,
+  NULL AS FINAL_WORK_ORDER_NO,
+  D.LEVEL_CODE,
+  D.HIERARCHY_LEVEL,
+  'QT_CO' AS ALLOCATION_TYPE,
+  NULL AS BOM_TYPE,
+  0 AS ISSUED_QTY,
+  100 PRIORITY_CODE,
+  NULL, NULL, NULL,NULL VENDOR_NO,
+  D.DUE_DATE PARENT_ORDER_DUE_DATE,
+  D.ORDER_NO PARENT_ORDER_NO_DUE_DATE,
+  D.LINE_NO PARENT_ORDER_LINE_NO_DUE_DATE,
+  D.PEGGING_WITHIN_LEAD_TIME,
+  D.SEQ_NO SEQ_NO ,
+  D.PARENT_PEGGING_TYPE PARENT_PEGGING_TYPE,
+  D.SEQ_NO AS PARENT_SEQ_NO,
+  D.PARENT_WORK_ORDER_NO AS PARENT_WORK_ORDER_NO,
+  D.PARENT_ITEM_NO  AS PARENT_ITEM_NO,
+  V_BUC AS WAREHOUSE
+FROM SD_CONFIGURATOR_BOM A, MRP_ALLOCATION_TEMP  D,SD_QUOTATION_DETAIL QD
+WHERE A.ITEM_NO = C_ITEM_NO
+AND   D.WORK_ORDER_NO = 'NO-PLAN'
+AND   D.ALLOCATION_TYPE  = 'QT_WO'
+AND A.CONFIGURATOR_ID = QD.CONFIGURATOR_ID
+AND SUBSTR(D.ORDER_NO,4) = QD.QUOTATION_NO
+AND QD.CONFIGURATOR_ID IS NOT NULL 
+UNION ALL
+-- FORECAST
+Select 1000000 as SORT_ORDER,
+      'FORECAST-'||TO_CHAR(RECORD_NO) ORDER_NO,
+      1 LINE_NO,
+      a.invoice_date,
+      trim(a.ITEM_NO), 
+      i.current_revision_no ITEM_REVISION_NO,
+     a.sales_qty-nvl(d.allocated_qty,0) AS BALANCE_QTY_BASE_UOM,
+     NULL AS RELEASE_DATE,
+     'FORECAST-'||TO_CHAR(RECORD_NO) as PARENT_ORDER_NO,
+     1 PARENT_ORDER_LINE_NO ,
+     NULL as final_work_order_no,
+     null as level_code,
+     null as hierarchy_level,
+     'FO_WO' allocation_type,
+     NULL AS BOM_TYPE,
+     0 AS ISSUED_QTY,
+     100 PRIORITY_CODE,
+     null,
+     null,
+     null,
+     NULL VENDOR_NO,
+     NULL PARENT_ORDER_DUE_DATE,
+     NULL PARENT_ORDER_no_U_date,
+     NULL PARENT_ORDER_invoice_date,         
+    case when (
+               A.INVOICE_DATE <=V_SYSDATE+R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS AND
+                      R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS<>0
+              ) THEN 'Y'
+        ELSE 'N'
+    End Pegging_Within_Lead_Time,
+    null seq_no,
+    null PARENT_PEGGING_TYPE,
+    Null As Parent_Seq_No,   
+    NULL AS PARENT_WORK_ORDER_NO,  
+    A.ITEM_NO AS PARENT_ITEM_NO,
+    V_BUC AS WAREHOUSE
+from SD_SALES_FORECAST a,
+ (select sum(qty) allocated_qty , order_no , line_no from MRP_allocation_TEMP
+ where NVL(WORK_ORDER_NO,PO_NO) <> 'NO-PLAN' 
+ group by order_no , line_no) d,
+ im_items i
+WHERE  TRIM(A.ITEM_no) = C_ITEM_NO
+and A.ITEM_no = i.ITEM_no(+)
+ AND A.SALES_QTY-nvl(d.allocated_qty,0) >0
+  AND TO_CHAR(A.RECORD_NO) = D.ORDER_NO(+)
+  AND V_START_FORCAST_AFTER >0
+  AND  A.invoice_date >= V_START_FORCAST_AFTER + V_SYSDATE
+UNION ALL
+SELECT 
+  1000000 AS SORT_ORDER,
+  WB.WORK_ORDER_NO AS ORDER_NO,
+  WB.STEP_ID AS LINE_NO,
+  NVL(WORKING_DATE_FROM_DATE(TRUNC(F.ALLOC_DUE_DATE),
+  DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',-NVL(PROCESSING_DAYS,0),-NVL(IM.MRP_LEAD_TIME,0))),V_SYSDATE) AS DUE_DATE,
+  WB.ITEM_NO AS ITEM_NO,
+  WB.ITEM_REVISION_NO ,
+  (
+    (WB.QTY_REQUIRED_PER_CYCLE*DECODE(WB.BOM_TYPE,
+                                      'MP',AT.QTY,
+                                      'MB',AT.QTY/NVL(WB.BATCH_SIZE,1)
+                                      ,1
+                                   )
+    ) 
+--    - (CASE WHEN AT.SEQ_NO = NVL(DD.SEQ_NO,1) THEN NVL(DD.QTY,0)
+--             ELSE 0
+--             END)
+  ) AS BALANCE_QTY_BASE_UOM, 
+  WO.RELEASE_DATE,
+  NVL(AT.PARENT_ORDER_NO,AT.ORDER_NO) AS PARENT_ORDER_NO,
+  NVL(AT.PARENT_ORDER_LINE_NO,AT.LINE_NO) AS PARENT_ORDER_LINE_NO,
+  NVL(AT.FINAL_WORK_ORDER_NO,WB.WORK_ORDER_NO) FINAL_WORK_ORDER_NO,
+  AT.LEVEL_CODE,
+  AT.HIERARCHY_LEVEL,
+  'WO_CO' ALLOCATION_TYPE,
+  WB.BOM_TYPE  AS BOM_TYPE,
+  VWB.BALANCE_IN_ISSUED_QTY,
+  WO.PRIORITY_CODE PRIORITY_CODE,
+  NULL PO_NO,
+  NULL PO_LINE_NO,
+  NULL WORK_ORDER_NO,
+  NULL VENDOR_NO,
+  AT.DUE_DATE PARENT_ORDER_DUE_DATE,
+  AT.ORDER_NO PARENT_ORDER_NO_DUE_DATE,
+  AT.LINE_NO PARENT_ORDER_LINE_NO_DUE_DATE,
+  AT.PEGGING_WITHIN_LEAD_TIME PEGGING_WITHIN_LEAD_TIME,
+  AT.SEQ_NO SEQ_NO,
+  AT.PARENT_PEGGING_TYPE PARENT_PEGGING_TYPE,
+  AT.SEQ_NO As Parent_Seq_No, 
+  WB.WORK_ORDER_NO AS PARENT_WORK_ORDER_NO,
+  AT.PARENT_ITEM_NO AS PARENT_ITEM_NO,
+  NVL(WO.WAREHOUSE_NO,V_BUC) AS WAREHOUSE
+FROM 
+	MFG_WO_BOM WB,
+	MFG_WORK_ORDER WO,
+	/*V_WO_BOM_BALANCE_QTY_PEGG C,*/
+	V_WO_BOM_BALANCE_QTY_MMD VWB,
+	MRP_ALLOCATION_TEMP  AT,
+	IM_ITEMS IM,
+  (
+    SELECT MIN(DUE_DATE) ALLOC_DUE_DATE ,
+      WORK_ORDER_NO
+    FROM MRP_ALLOCATION_TEMP
+    WHERE ORDER_NO NOT LIKE '%QC_ALLW%'
+    GROUP BY WORK_ORDER_NO
+  ) F
+--  ,
+--  (
+--    SELECT PARENT_SEQ_NO SEQ_NO,ORDER_NO,LINE_NO,QTY
+--      FROM MRP_ALLOCATION_TEMP
+--     WHERE ALLOCATION_TYPE = 'WO_CO'
+--          AND SO_WO_LINK = 'Y'
+--          AND QTY <> 0
+--  ) DD
+WHERE WB.WORK_ORDER_NO = WO.WORK_ORDER_NO
+AND WB.ITEM_NO = C_ITEM_NO
+AND   WB.WORK_ORDER_NO = VWB.WORK_ORDER_NO
+AND   WB.STEP_ID = VWB.STEP_ID
+--     and   VWB.BALANCE_QTY  > 0 /* COMMENTED ON 25-FEB-2016,WHILE WORKING IN LDLW GOT THESE ISSUES AND FIXED, MMD*/
+AND   NVL(WO.DO_NOT_INCLUDE_IN_PLANNING,'N')='N'
+AND   WO.WORK_ORDER_NO = AT.WORK_ORDER_NO 
+AND   WO.WORK_ORDER_NO = F.WORK_ORDER_NO(+)
+AND   WO.ITEM_NO = IM.ITEM_NO
+AND   WO.STATUS IN ('OR','ON','OE')
+--AND   DD.ORDER_NO(+) = WB.WORK_ORDER_NO 
+--AND   DD.LINE_NO(+) = WB.STEP_ID
+AND AT.QTY <> 0
+AND (NVL(VWB.REQ_QTY,0)+NVL(VWB.BALANCE_IN_ISSUED_QTY,0)) > 0
+UNION ALL
+      -- Block-8
+      -- To get the demand from the not pegged /Partial pegged work order for the item 
+      -- Demand calculated based BOM Type defined in WO
+      -- Demand will explode based on not pegged qty of wo
+    select 1000001 as SORT_ORDER,a.WORK_ORDER_NO as ORDER_NO, a.STEP_ID as LINE_NO,
+    WORKING_DATE_FROM_DATE
+        (NVL(trunc(F.ALLOC_DUE_DATE),
+               NVL(B.REQUIRED_DATE,
+                      NVL(B.SCHEDULED_START_DATE,B.Entry_Date)
+                      )
+             ),
+              DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',-NVL(PROCESSING_DAYS,0),-NVL(E.MRP_LEAD_TIME,0))
+         )    As Due_Date,
+                   a.ITEM_NO as ITEM_NO,a.ITEM_REVISION_NO ,
+                  ( 
+                  DECODE(a.BOM_TYPE,'MP',
+                  (
+                  C.REQ_QTY  + BALANCE_IN_ISSUED_QTY
+                  - (NVL(F.WO_ALLOC_QTY,0)*(A.QTY_REQUIRED_PER_CYCLE))
+                 
+                  ),'MB',
+                  C.REQ_QTY  + BALANCE_IN_ISSUED_QTY
+                  - ((NVL(F.WO_ALLOC_QTY,0)*(A.QTY_REQUIRED_PER_CYCLE))
+                  )/NVL(a.BATCH_SIZE,1)
+				  ,
+                  C.REQ_QTY  + BALANCE_IN_ISSUED_QTY
+                  ))
+                   -NVL(0,0) as BALANCE_QTY_BASE_UOM ,   
+                  NVL(B.RELEASE_DATE,b.ENTRY_DATE),
+                  CASE WHEN sf_get_pegged_wo(a.WORK_ORDER_NO)='Y' THEN
+                  a.WORK_ORDER_NO
+                  else
+                  'NOT PEGGED:'||a.WORK_ORDER_NO
+                  END
+                  as PARENT_ORDER_NO,
+                  -1 as parent_order_line_no,
+                  A.WORK_ORDER_NO as FINAL_WORK_ORDER_NO, null LEVEL_CODE, null HIERARCHY_LEVEL, 'WO_CO' ALLOCATION_TYPE,
+                  A.BOM_TYPE AS BOM_TYPE,  BALANCE_IN_ISSUED_QTY, 
+                  B.Priority_Code Priority_Code,NULL po_no,NULL po_line_no,NULL work_order_no,NULL VENDOR_NO
+             ,
+                         null  PARENT_ORDER_DUE_DATE
+             , null PARENT_ORDER_no_DUE_DATE,null PARENT_ORDER_Line_no_DUE_DATE
+             ,'N' Pegging_Within_Lead_Time
+             ,
+          -1 seq_no          ,
+          NULL PARENT_PEGGING_TYPE,
+          NULL As Parent_Seq_No,
+          A.WORK_ORDER_NO as PARENT_WORK_ORDER_NO, 
+          B.ITEM_NO  AS PARENT_ITEM_NO,
+          B.WAREHOUSE_NO AS WAREHOUSE
+             from mfg_wo_bom a, mfg_work_order b,
+             /*V_WO_BOM_BALANCE_QTY_PEGG  C,*/
+             V_WO_BOM_BALANCE_QTY_MMD C,
+              im_items e,
+              (select min(due_date) alloc_due_date, sum(qty) WO_ALLOC_QTY, work_order_no from mrp_allocation_temp
+                    where ORDER_NO not like '%QC_ALLW%' group by WORK_ORDER_NO) F,
+                 IM_ITEMS G,IM_ITEMS I,
+--                        (select SUM(QTY) QTY, WORK_ORDER_NO from mrp_allocation_temp                        
+--                        --WHERE NVL(PARENT_ORDER_NO,'MURALIDHAR') NOT LIKE '%QC_ALLW%'
+--                    group by WORK_ORDER_NO
+--                    ) H ,
+                    /*a_work_order_pegg Z*/
+                    V_MRP_WO_INFO Z
+            where a.WORK_ORDER_NO = B.WORK_ORDER_NO
+            and a.item_no = c_item_no
+            and   a.WORK_ORDER_NO = C.WORK_ORDER_NO
+            and   a.WORK_ORDER_NO = z.WORK_ORDER_NO
+            and   a.ITEM_NO = G.ITEM_NO
+            AND   B.ITEM_NO = I.ITEM_NO
+            and   a.STEP_ID = C.STEP_ID
+--          and   C.BALANCE_QTY  > 0 /* COMMENTED ON 25-FEB-2016,WHILE WORKING IN LDLW GOT THESE ISSUES AND FIXED, MMD*/
+--          and   nvl(Z.BALANCE_QTY_NEW,0)-NVL(H.QTY,0) > 0
+            and   nvl(Z.BALANCE_QTY_NEW,0)-NVL(F.WO_ALLOC_QTY,0) > 0
+--          and   B.WORK_ORDER_NO = H.WORK_ORDER_NO(+)
+            and   nvl(b.do_not_include_in_planning,'N')='N'
+            and   b.work_order_no = f.work_order_no(+)
+            and   B.ITEM_NO = E.ITEM_NO
+            and   B.STATUS in ('OR','ON','OE')
+     UNION ALL
+      -- Block-9
+      -- To get the demand from the NO-PLAN of the parent item for the item 
+      -- Demand calculated based BOM Type defined in Standard BOM
+      -- Demand will explode based on NO-PLAN qty 
+      
+     select 1000000 as SORT_ORDER,a.BOM_ROUTING_ID as ORDER_NO,a.STEP_ID as LINE_NO, --BOM
+       NVL(WORKING_DATE_FROM_DATE(trunc(D.DUE_DATE),
+       DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',-SF_GET_LEAD_TIME_DAYS(E.ITEM_NO,D.QTY),--SF_GET_LEAD_TIME_DAYS2(E.ITEM_NO,D.QTY),
+       -Nvl(E.Mrp_Lead_Time,0))),V_SYSDATE) As Due_Date,
+       a.item_no as item_no, a.ITEM_REVISION_NO,
+       (a.qty_required)*decode(a.bom_type,'MP',d.qty,'MB',d.qty/nvl(a.batch_size,1),1) as balance_qty_base_uom,
+       null,nvl(d.parent_order_no,d.order_no) as parent_order_no, nvl(d.parent_order_line_no,d.line_no) as parent_order_line_no,
+       null AS FINAL_WORK_ORDER_NO, d.level_code, d.hierarchy_level,'BOM_CO' as allocation_type,
+       NULL AS BOM_TYPE, 0 AS ISSUED_QTY,100 PRIORITY_CODE,
+       null, null, null,NULL VENDOR_NO,
+              D.DUE_DATE PARENT_ORDER_DUE_DATE
+        , d.ORDER_NO PARENT_ORDER_no_DUE_DATE,d.LINE_NO PARENT_ORDER_Line_no_DUE_DATE
+        ,   D.Pegging_Within_Lead_Time
+          ,
+          D.SEQ_NO seq_no          ,
+          D.PARENT_PEGGING_TYPE PARENT_PEGGING_TYPE,
+          D.SEQ_NO As Parent_Seq_No,
+          d.parent_work_order_no AS PARENT_WORK_ORDER_NO,
+          D.PARENT_ITEM_NO  AS PARENT_ITEM_NO,
+          NVL(D.WAREHOUSE,V_BUC) AS WAREHOUSE
+      from mfg_bom_master a, mrp_allocation_temp  d, im_items e, MFG_BOM_routing_master f
+       where a.item_no = c_item_no
+       AND   D.WORK_ORDER_NO = 'NO-PLAN'
+       and   f.item_no = d.item_no
+       and   f.item_no = e.item_no
+       and   a.RECORD_NO = F.RECORD_NO
+       and d.ORDER_NO not like '%QC_ALLW%'
+       AND d.order_no <> 'SAFETY STOCK'
+       and   nvl(f.default_version,'N')='Y'
+       and   NVL(F.DEFAULT_ROUTING,'N')='Y'
+       AND D.ITEM_REVISION_NO =F.ITEM_REVISION_NO
+       AND D.ALLOCATION_TYPE NOT IN ( 'QT_WO','QT_CO')
+       UNION ALL
+     select 1000000 as SORT_ORDER,a.BOM_ROUTING_ID as ORDER_NO,a.STEP_ID as LINE_NO, --BOM
+       NVL(WORKING_DATE_FROM_DATE(trunc(D.DUE_DATE),
+       DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',-SF_GET_LEAD_TIME_DAYS(E.ITEM_NO,D.QTY),--SF_GET_LEAD_TIME_DAYS2(E.ITEM_NO,D.QTY),
+       -Nvl(E.Mrp_Lead_Time,0))),V_SYSDATE) As Due_Date,
+       a.item_no as item_no, a.ITEM_REVISION_NO,
+       (a.qty_required)*decode(a.bom_type,'MP',d.qty,'MB',d.qty/nvl(a.batch_size,1),1) as balance_qty_base_uom,
+       null,nvl(d.parent_order_no,d.order_no) as parent_order_no, nvl(d.parent_order_line_no,d.line_no) as parent_order_line_no,
+       null AS FINAL_WORK_ORDER_NO, d.level_code, d.hierarchy_level,'BOM_CO' as allocation_type,
+       NULL AS BOM_TYPE, 0 AS ISSUED_QTY,100 PRIORITY_CODE,
+       null, null, null,NULL VENDOR_NO,
+              D.DUE_DATE PARENT_ORDER_DUE_DATE
+        , d.ORDER_NO PARENT_ORDER_no_DUE_DATE,d.LINE_NO PARENT_ORDER_Line_no_DUE_DATE
+        ,   D.Pegging_Within_Lead_Time
+          ,
+          D.SEQ_NO seq_no          ,
+          D.PARENT_PEGGING_TYPE PARENT_PEGGING_TYPE,
+          D.SEQ_NO As Parent_Seq_No,
+          d.parent_work_order_no AS PARENT_WORK_ORDER_NO,
+          D.PARENT_ITEM_NO  AS PARENT_ITEM_NO ,
+          NVL(D.WAREHOUSE,V_BUC) AS WAREHOUSE
+      from mfg_bom_master a, mrp_allocation_temp  d, im_items e, MFG_BOM_routing_master f
+       where a.item_no = c_item_no
+       AND   D.WORK_ORDER_NO = 'NO-PLAN'
+       and   f.item_no = d.item_no
+       and   f.item_no = e.item_no
+       and   a.RECORD_NO = F.RECORD_NO
+       and d.ORDER_NO not like '%QC_ALLW%'
+       AND d.order_no <> 'SAFETY STOCK'
+       and   nvl(f.default_version,'N')='Y'
+       and   NVL(F.DEFAULT_ROUTING,'N')='Y'
+       AND D.ITEM_REVISION_NO =F.ITEM_REVISION_NO
+       AND D.ALLOCATION_TYPE IN ( 'QT_WO','QT_CO')
+       AND  NOT EXISTS (
+                          (
+                            SELECT NULL
+                            FROM SD_ESTIMATE_BOM EB,SD_QUOTATION_DETAIL QD
+                            WHERE EB.QUOTATION_NO = QD.QUOTATION_NO
+--                            AND EB.QUOTATION_NO = '50010'
+                            AND qd.configurator_id IS NULL
+                            AND EB.ITEM_NO IS NOT NULL
+                            AND EB.QUOTATION_NO = SUBSTR(d.ORDER_NO,4)
+                          )                           
+                        )
+   )
+   ORDER BY SORT_ORDER,DUE_DATE,CASE WHEN ALLOCATION_TYPE = 'SO_WO' THEN 1 
+                                      WHEN ALLOCATION_TYPE = 'WO_CO' THEN 2 
+                                      ELSE 3 END;
+-- DEMAND CURSOR, END
+V_Qty   Number;  
+V_Index Varchar2(500);
+V_LOWER_INDEX VARCHAR2(500);
+V_NUMBER NUMBER;
+V_STOCK_INDEX VARCHAR2(150);
+V_Level_Code              Inv_Allocation.Level_Code%Type;
+V_Hierarchy_Level         Inv_Allocation.Hierarchy_Level%Type;
+V_EXECUTION_TIME char(1) default 'Y';
+v_Start_date             TIMESTAMP(6);
+v_start_time             number;
+vP_Start_date             TIMESTAMP(6);
+vP_start_time             number;
+
+
+v_Start_date_1             TIMESTAMP(6);
+v_start_time_1             number;
+
+v_MAIN_Start_date             TIMESTAMP(6);
+v_MAIN_start_time             number;
+
+CURSOR C_ITEM_QTY_LTIME
+IS
+SELECT item_no,qty,ITEM_NO||'~'||QTY item_qty,SF_GET_item_LEAD_TIME_DAYS(ITEM_NO,QTY) LEAD_TIME
+FROM (SELECT DISTINCT ITEM_NO,QTY
+FROM INV_ALLOCATION o
+where not exists (select null from a_item_qty_lead_time i where i.item_no = o.item_no and i.qty = o.qty))
+UNION ALL
+select ITEM_NO,QTY,ITEM_NO||'~'||QTY,LEADTIME from a_item_qty_lead_time ;
+
+BEGIN
+
+IF V_EXECUTION_TIME='Y' THEN
+  EXECUTE IMMEDIATE 'Truncate Table MRP_PEGGING_PROCESSING_TIME';
+  V_MAIN_START_DATE:=SYSDATE;
+  V_MAIN_START_TIME:=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging Started ' ,V_MAIN_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_MAIN_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE:=SYSDATE;
+  V_START_TIME:=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging SP_PRE_AUDIT ' ,V_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+  SP_PRE_AUDIT;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging SP_PRE_AUDIT ' ,V_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+V_SEQ_NO := 554;
+-- DELETE FROM MRP_ALLOCATION_TEMP;
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging status/app settings' ,V_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+  LP_GET_APP_SETTINGS;
+  LP_UPDATE_WO_SO_PO_STATUS;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging status/app settings' ,V_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging SP_UPD_ITEMS_IN_MRP' ,V_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+  IF P_ITEM_NO IS NULL 
+  THEN
+    SP_UPD_ITEMS_IN_MRP;
+    ELSE
+    SP_UPD_ITEMS_IN_MRP(P_ITEM_NO);
+  END IF;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging SP_UPD_ITEMS_IN_MRP' ,V_START_DATE ,NULL ,((
+  DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging SP_UPDATE_LLC_MATERIAL_MASTER' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+  SP_UPDATE_LLC_MATERIAL_MASTER;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging SP_UPDATE_LLC_MATERIAL_MASTER' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging SP_UPD_CUM_MRP_LEAD_TIME' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+  IF R_APP_SETTINGS.IM_LEAD_TIME <> 'C'
+  THEN
+    SP_UPD_CUM_MRP_LEAD_TIME;
+  END IF;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging SP_UPD_CUM_MRP_LEAD_TIME' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging LP_INSERT_TEMP_DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+  LP_INSERT_TEMP_DATA;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging LP_INSERT_TEMP_DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+---- 
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging LEADTIME NEW' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+OPEN C_ITEM_QTY_LTIME;
+FETCH C_ITEM_QTY_LTIME BULK COLLECT INTO ITEM_QTY_TAB1;
+CLOSE C_ITEM_QTY_LTIME;
+
+IF ITEM_QTY_TAB1.COUNT> 0
+THEN
+  FOR I IN ITEM_QTY_TAB1.FIRST..ITEM_QTY_TAB1.LAST
+  LOOP
+    ITEM_QTY_TAB(ITEM_QTY_TAB1(I).ITEM_QTY) := ITEM_QTY_TAB1(i);
+  END LOOP;
+--  ITEM_QTY_TAB1.DELETE;
+END IF;
+if ITEM_QTY_TAB1.count> 0 
+then
+EXECUTE IMMEDIATE 'TRUNCATE TABLE a_item_qty_lead_time';
+forall i in ITEM_QTY_TAB1.first..ITEM_QTY_TAB1.last 
+INSERT INTO a_item_qty_lead_time VALUES ITEM_QTY_TAB1(i);
+ITEM_QTY_TAB1.delete;
+end if;
+commit;
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging LEADTIME NEW' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+--
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging DELETING TEMP TABLE DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+----
+
+  DELETE FROM MRP_ALLOCATION_TEMP;
+  COMMIT;
+-- POPULATING PREV RUN ,START
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging DELETING TEMP TABLE DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging TEMP DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+OPEN C_PREV_RUN;
+FETCH C_PREV_RUN BULK COLLECT INTO PREV_RUN_TAB_T;
+CLOSE C_PREV_RUN ;
+  IF PREV_RUN_TAB_T.COUNT >0 THEN
+    FOR I IN PREV_RUN_TAB_T.FIRST..PREV_RUN_TAB_T.LAST
+    LOOP
+      PREV_RUN_TAB(PREV_RUN_TAB_T(I).PREV_RUN_INDEX) := PREV_RUN_TAB_T(I);
+--      DISPLAY(PREV_RUN_TAB(PREV_RUN_TAB_T(I).PREV_RUN_INDEX).PREV_RUN_INDEX);
+    END LOOP;
+  PREV_RUN_TAB_T.DELETE;    
+  END IF;
+-- POPULATING PREV RUN ,END  
+
+-- POPULATING STOCK ,START
+OPEN C_STOCK;
+FETCH C_STOCK BULK COLLECT INTO STOCK_TAB_T;
+CLOSE C_STOCK ;
+
+if STOCK_TAB_T.count>0
+then
+  FOR I IN STOCK_TAB_T.FIRST..STOCK_TAB_T.LAST
+  LOOP
+    STOCK_TAB(STOCK_TAB_T(I).STOCK_INDEX) := STOCK_TAB_T(I);
+--    DISPLAY(STOCK_TAB(STOCK_TAB_T(I).STOCK_INDEX).STOCK_INDEX);
+  END LOOP;
+  STOCK_TAB_T.DELETE;
+END IF;
+
+--  SELECT * 
+--  BULK COLLECT INTO T_STOCK_TAB
+--  FROM G_MRP_STOCK;
+--
+--  FOR I IN T_STOCK_TAB.FIRST..T_STOCK_TAB.LAST
+--  LOOP
+----    STOCK_TAB(T_STOCK_TAB(I).ORDER_NO) := T_PREV_RUN_TAB(I);
+----    DISPLAY(PREV_RUN_TAB(T_PREV_RUN_TAB(I).ORDER_NO).LINE_NO);
+--NULL;
+--  END LOOP;
+  
+-- POPULATING STOCK ,END
+
+-- MOVING FROM LOOP TO OUTSIDE ,START
+--1.
+-- POPULATING SO WO COMPLETIG QTY ,START
+
+      SELECT 
+           TD.WORK_ORDER_NO||'~'||ROW_NUMBER() OVER(PARTITION BY TD.WORK_ORDER_NO ORDER BY TD.WORK_ORDER_NO) WO_INDEX,
+           TD.WORK_ORDER_NO,
+           INV.LOT_NO,
+           INV.WAREHOUSE,
+        SUM(INV.INVENTORY_UOM_BALANCE_QTY) AS BALANCE_AVAILABLE,
+        0,0
+      BULK COLLECT INTO WO_T        
+      FROM V_INVENTORY_BALANCE INV,
+        MFG_TC_DETAIL TD
+      WHERE INV.LOT_NO         =TD.LOT_NO_CREATED
+      AND TD.TC_REPORTING_TYPE='COMPLETION'
+      AND INV.ITEM_NO          =TD.ITEM_NO
+      AND EXISTS (SELECT NULL FROM MRP_ALLOCATION_PREV_RUN PR WHERE TD.WORK_ORDER_NO = PR.WORK_ORDER_NO AND PR.ALLOCATE_FROM = 'WO')
+      AND NOT EXISTS (SELECT NULL FROM MRP_ALLOCATION_PREV_RUN PR WHERE INV.LOT_NO = PR.LOT_NO AND PR.ALLOCATE_FROM = 'STOCK')
+--      AND EXISTS (SELECT NULL 
+--                  FROM MFG_WO_SALES_ORDERS SW 
+--                  WHERE SW.WORK_ORDER_NO = TD.WORK_ORDER_NO
+--                  )
+    HAVING SUM(INV.INVENTORY_UOM_BALANCE_QTY) > 0
+/*** Syntax Error at line 2,357, column 50
+
+
+    HAVING SUM(INV.INVENTORY_UOM_BALANCE_QTY) > 0              
+                                                  ^^^           
+
+Expected: 
+ ***/              
+    GROUP BY TD.WORK_ORDER_NO,INV.ITEM_NO,INV.WAREHOUSE,INV.LOT_NO;
+IF WO_T.COUNT>0 THEN
+FOR I IN WO_T.FIRST..WO_T.LAST
+LOOP
+  WO_TAB(WO_T(I).WO_INDEX).WORK_ORDER_NO := WO_T(I).WORK_ORDER_NO;
+  WO_TAB(WO_T(I).WO_INDEX).LOT_NO := WO_T(I).LOT_NO;
+  WO_TAB(WO_T(I).WO_INDEX).BALANCE_AVAILABLE := WO_T(I).BALANCE_AVAILABLE;
+  WO_TAB(WO_T(I).WO_INDEX).ALLOCATED_QTY := WO_T(I).ALLOCATED_QTY;
+  WO_TAB(WO_T(I).WO_INDEX).AVAILABLE_QTY := WO_T(I).BALANCE_AVAILABLE;
+  WO_TAB(WO_T(I).WO_INDEX).WAREHOUSE := WO_T(I).WAREHOUSE;
+END LOOP;
+WO_T.DELETE;
+END IF;
+-- POPULATING SO WO COMPLETIG QTY ,END    
+
+--2.
+-- POPULATING WO BALANCE QTY, START
+  SELECT DISTINCT WORK_ORDER_NO,ITEM_NO,ITEM_REVISION_NO,BALANCE_QTY,RELEASE_DATE WO_RELEASE_DATE
+  BULK COLLECT INTO T_WO_TAB
+  FROM V_MRP_WO_INFO
+  Where Work_Order_Status In ('OR','ON','OE')
+  AND DO_NOT_INCLUDE_IN_PLANNING = 'N'
+  AND BALANCE_QTY > 0;
+
+IF T_WO_TAB.COUNT> 0 
+THEN
+  FOR I IN T_WO_TAB.FIRST..T_WO_TAB.LAST
+  LOOP
+    WO_BAL_TAB(T_WO_TAB(I).WORK_ORDER_NO).ITEM_NO := T_WO_TAB(I).ITEM_NO;
+    WO_BAL_TAB(T_WO_TAB(I).WORK_ORDER_NO).ITEM_REVISION_NO := T_WO_TAB(I).ITEM_REVISION_NO;
+    WO_BAL_TAB(T_WO_TAB(I).WORK_ORDER_NO).BALANCE_QTY := T_WO_TAB(I).BALANCE_QTY;
+    WO_BAL_TAB(T_WO_TAB(I).WORK_ORDER_NO).ALLOCATED_QTY := 0;
+    WO_BAL_TAB(T_WO_TAB(I).WORK_ORDER_NO).AVAILABLE_QTY := T_WO_TAB(I).BALANCE_QTY;
+    WO_BAL_TAB(T_WO_TAB(I).WORK_ORDER_NO).WO_RELEASE_DATE := T_WO_TAB(I).WO_RELEASE_DATE;    
+  END LOOP;
+ T_WO_TAB.DELETE;
+END IF;  
+  
+-- POPULATING WO BALANCE QTY, END
+
+--3.
+-- POPILATING WO INFO INTO COLLECTION  START
+--  OPEN C_ITEM_WO_BAL;
+--  FETCH C_ITEM_WO_BAL BULK COLLECT INTO ITEM_WO_BAL_TAB_T;
+--  CLOSE C_ITEM_WO_BAL;
+--FOR I IN   ITEM_WO_BAL_TAB_T.FIRST..ITEM_WO_BAL_TAB_T.LAST
+--LOOP
+--  ITEM_WO_BAL_TAB(ITEM_WO_BAL_TAB_T(I).ITEM_WO_INDEX) :=  ITEM_WO_BAL_TAB_T(I);
+--END LOOP;
+--ITEM_WO_BAL_TAB_T.DELETE;
+
+-- POPILATING WO INFO INTO COLLECTION  END
+
+--4.
+-- POPILATING PO INFO INTO COLLECTION  START
+--  OPEN C_ITEM_PO_BAL;
+--  FETCH C_ITEM_PO_BAL BULK COLLECT INTO ITEM_PO_BAL_TAB_T;
+--  CLOSE C_ITEM_PO_BAL;
+--IF ITEM_PO_BAL_TAB_T.COUNT > 0
+--THEN  
+--  FOR I IN   ITEM_PO_BAL_TAB_T.FIRST..ITEM_PO_BAL_TAB_T.LAST
+--  LOOP
+--    ITEM_PO_BAL_TAB(ITEM_PO_BAL_TAB_T(I).ITEM_PO_INDEX) :=  ITEM_PO_BAL_TAB_T(I);
+--  END LOOP;
+--  ITEM_PO_BAL_TAB_T.DELETE;
+--END IF;
+---- POPILATING PO INFO INTO COLLECTION  END
+
+
+--TYPE PO_BAL_TYP1 IS TABLE OF C_PO%ROWTYPE INDEX BY PLS_INTEGER;
+--PO_BAL_TAB1 PO_BAL_TYP1;
+--TYPE PO_BAL_TYP IS TABLE OF C_PO%ROWTYPE INDEX BY VARCHAR2(150);
+--PO_BAL_TAB PO_BAL_TYP;
+OPEN C_PO;
+FETCH C_PO  BULK COLLECT INTO PO_BAL_TAB1;
+CLOSE C_PO;
+
+IF PO_BAL_TAB1.COUNT > 0 
+THEN 
+  FOR  I IN PO_BAL_TAB1.FIRST..PO_BAL_TAB1.LAST
+  loop
+    PO_BAL_TAB(PO_BAL_TAB1(i).po_index) := PO_BAL_TAB1(i);
+  END LOOP;
+PO_BAL_TAB1.DELETE;  
+END IF;
+
+--5.
+-- POPULATING WO SCRAP INFO BASED ON ITEM MASTER, START
+  OPEN C_SCRAP_ALLOCATION;
+  FETCH C_SCRAP_ALLOCATION BULK COLLECT INTO WO_SCRAP_TAB;
+  CLOSE C_SCRAP_ALLOCATION;
+-- POPULATING WO SCRAP INFO BASED ON ITEM MASTER, END
+
+--6.
+-- POPULATING WO ISSUE DETAILS, START
+  OPEN C_WO_ISSUED;
+  FETCH C_WO_ISSUED BULK COLLECT INTO WO_ISSUED_TAB_T;
+  CLOSE C_WO_ISSUED;
+  IF WO_ISSUED_TAB_T.COUNT > 0 THEN 
+  FOR WO_ISS IN WO_ISSUED_TAB_T.FIRST..WO_ISSUED_TAB_T.LAST LOOP
+    WO_ISSUED_TAB(WO_ISSUED_TAB_T(WO_ISS).WORK_ORDER_NO||'~'||WO_ISSUED_TAB_T(WO_ISS).STEP_ID||'~'||WO_ISSUED_TAB_T(WO_ISS).ITEM_NO)
+    := WO_ISSUED_TAB_T(WO_ISS);
+  END LOOP;
+  END IF;
+ WO_ISSUED_TAB_T.DELETE;
+ -- POPULATING WO ISSUE DETAILS, END
+
+TAB_BOM_BAL_QTY.DELETE;
+FOR I IN (
+SELECT WORK_ORDER_NO||'~'||STEP_ID||'~'||ITEM_NO BOM_INDX,(BALANCE_IN_ISSUED_QTY+ REQ_QTY) QTY
+  FROM V_WO_BOM_BALANCE_QTY_MMD
+  WHERE BALANCE_IN_ISSUED_QTY > 0 OR REQ_QTY > 0
+  ) LOOP
+  TAB_BOM_BAL_QTY(I.BOM_INDX) := I ;
+END LOOP;
+
+---- START
+--OPEN C1;
+--FETCH C1 BULK COLLECT INTO TAB_PC_WO_BAL;
+--CLOSE C1;
+--IF TAB_PC_WO_BAL.COUNT> 0 
+--THEN 
+--  FOR I IN TAB_PC_WO_BAL.FIRST..TAB_PC_WO_BAL.LAST
+--  LOOP
+--   TAB1_PC_WO_BAL(TAB_PC_WO_BAL(I).PWO) := TAB_PC_WO_BAL(I);
+--  END LOOP;
+--  TAB_PC_WO_BAL.DELETE;
+--END IF;
+--
+----END
+
+-- MOVING FROM LOOP TO OUTSIDE ,END
+V_NUMBER := LF_CURSOR;
+-- WO SCRAP INSERTION, START
+
+IF WO_SCRAP_TAB.COUNT > 0 THEN
+  FOR WO_SCRAP IN WO_SCRAP_TAB.FIRST..WO_SCRAP_TAB.LAST
+  LOOP
+    V_SEQ_NO  := V_SEQ_NO+1;
+    ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+
+    ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := WO_SCRAP_TAB(WO_SCRAP).ORDER_NO;
+    ALLOCATION_TAB(V_SEQ_NO).LINE_NO := WO_SCRAP_TAB(WO_SCRAP).LINE_NO;
+    ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := WO_SCRAP_TAB(WO_SCRAP).DUE_DATE;
+    ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := WO_SCRAP_TAB(WO_SCRAP).ITEM_NO;
+    ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := WO_SCRAP_TAB(WO_SCRAP).ITEM_REVISION_NO;
+    ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+    ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := 'S';
+    ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := 'N';
+    ALLOCATION_TAB(V_SEQ_NO).QTY  :=  WO_SCRAP_TAB(WO_SCRAP).SCRAP_QTY;
+    ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'WO';
+    ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO;
+    ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+    ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+    ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+    ALLOCATION_TAB(V_SEQ_NO).PEGGING_TYPE := WO_SCRAP_TAB(WO_SCRAP).PEGGING_TYPE;
+    ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := WO_SCRAP_TAB(WO_SCRAP).ALLOCATION_TYPE;
+    ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := WO_SCRAP_TAB(WO_SCRAP).LEVEL_CODE;
+    ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := WO_SCRAP_TAB(WO_SCRAP).HIERARCHY_LEVEL;
+    ALLOCATION_TAB(V_SEQ_NO).parent_order_no := WO_SCRAP_TAB(WO_SCRAP).parent_order_no;
+    ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := WO_SCRAP_TAB(WO_SCRAP).PARENT_ORDER_LINE_NO;
+    ALLOCATION_TAB(V_SEQ_NO).WO_RELEASE_DATE := WO_SCRAP_TAB(WO_SCRAP).WO_RELEASE_DATE;
+    IF WO_BAL_TAB.EXISTS(WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO) 
+    THEN 
+       WO_BAL_TAB(WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO).AVAILABLE_QTY := WO_BAL_TAB(WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO).AVAILABLE_QTY - R_MRP.QTY;
+       WO_BAL_TAB(WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO).ALLOCATED_QTY := WO_BAL_TAB(WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO).ALLOCATED_QTY + R_MRP.QTY;
+    END IF;    
+    ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := WO_SCRAP_TAB(WO_SCRAP).WAREHOUSE;
+-- REDUSING BALANCE FROM WO INFO DETAILS START
+--
+-- WO BALANCE REDUCE, START
+-- NOT REQUIRED AS THIS QTY IS ALREADY REDUCING IN MAIN WO BALANCE
+--  V_INDEX := ALLOCATION_TAB(V_SEQ_NO).ITEM_NO||'~'||1;
+--  IF ITEM_WO_BAL_TAB.EXISTS(V_INDEX)
+--  THEN  
+--    FOR WO IN 1..100
+--    LOOP
+--      IF ITEM_WO_BAL_TAB.EXISTS(V_INDEX) THEN
+--        IF ITEM_WO_BAL_TAB(V_INDEX).WORK_ORDER_NO = WO_SCRAP_TAB(WO_SCRAP).WORK_ORDER_NO THEN 
+--          ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY :=
+--                ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY-WO_SCRAP_TAB(WO_SCRAP).SCRAP_QTY;
+--          ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY := 
+--                ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY+WO_SCRAP_TAB(WO_SCRAP).SCRAP_QTY;
+--        EXIT;        
+--        END IF;
+--      ELSE 
+--       EXIT; 
+--      END IF;
+--      V_INDEX := ALLOCATION_TAB(V_SEQ_NO).ITEM_NO||'~'||(WO+1);
+--    END LOOP;
+--  END IF;
+--  V_INDEX := NULL;
+--  
+-- WO BALANCE REDUCE, END
+--
+-- REDUSING BALANCE FROM WO INFO DETAILS END    
+  END LOOP;
+END IF;  
+WO_SCRAP_TAB.DELETE;
+-- moving down ,start
+--IF ALLOCATION_TAB.COUNT> 0 THEN
+--  FORALL A IN ALLOCATION_TAB.FIRST..ALLOCATION_TAB.LAST
+--  INSERT INTO MRP_ALLOCATION_TEMP VALUES ALLOCATION_TAB(A);
+--END IF;
+--ALLOCATION_TAB.DELETE;
+-- moving down end
+
+-- WO SCRAP INSERTION, END
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging TEMP DATA' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('HARD PEGGING ITEMS' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+-- ITEMS LOOP FOR HARD DEMAND, START
+IF ITEM_TAB.COUNT> 0 
+THEN
+FOR IM IN  ITEM_TAB.FIRST..ITEM_TAB.LAST
+LOOP
+      FOR HD IN C_ORDERS_HARD(ITEM_TAB(IM).ITEM_NO) 
+      LOOP
+--START 
+IF HD.ALLOCATION_TYPE = 'WO_CO'
+THEN
+  IF TAB_BOM_BAL_QTY.EXISTS(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO)
+  THEN 
+    HD.DEMAND_QTY := LEAST(HD.DEMAND_QTY,TAB_BOM_BAL_QTY(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).QTY);
+    TAB_BOM_BAL_QTY(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).QTY := 
+    TAB_BOM_BAL_QTY(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).QTY-HD.DEMAND_QTY;
+  END IF;
+END IF;
+
+if HD.LEVEL_CODE is not null then
+    HD.LEVEL_CODE := to_number(HD.LEVEL_CODE)+1;
+    HD.HIERARCHY_LEVEL := substr(HD.HIERARCHY_LEVEL,1,HD.LEVEL_CODE*2+((HD.LEVEL_CODE-1)*4))||lpad(to_char(HD.line_no), 4,'0')||substr(HD.HIERARCHY_LEVEL,HD.LEVEL_CODE*2+((HD.LEVEL_CODE-1)*4)+4);
+else
+    HD.LEVEL_CODE := '0';
+    HD.HIERARCHY_LEVEL := '000000000000000000000000000000';
+end if;
+
+-- END
+        IF HD.ALLOCATION_TYPE = 'SO_WO'
+        THEN
+          IF HD.SO_WO_LINK = 'Y'
+          THEN
+-- POPULATING PARENT CHILD DETAILS IN TEMP TABLE
+DELETE FROM WO_PARENT_WO WHERE GRAND_PARENT = HD.WORK_ORDER_NO;          
+INSERT INTO WO_PARENT_WO(WORK_ORDER_NO,ITEM_NO,ITEM_REV_NO,PARENT_WORK_ORDER_NO,GRAND_PARENT)
+SELECT WORK_ORDER_NO ,ITEM_NO,ITEM_REVISION_NO,PARENT_WORK_ORDER_NO , HD.Work_Order_No
+  FROM MFG_WORK_ORDER
+  START WITH WORK_ORDER_NO = HD.Work_Order_No
+  CONNECT BY NOCYCLE PARENT_WORK_ORDER_NO = PRIOR WORK_ORDER_NO ;
+
+
+-- ALLOCATING WO COMPLETED QTY, START
+  FOR I IN 1..500
+  LOOP
+V_WO_INDEX := HD.WORK_ORDER_NO||'~'||I;  
+
+    IF WO_TAB.EXISTS(V_WO_INDEX) 
+    THEN 
+      IF WO_TAB(V_WO_INDEX).AVAILABLE_QTY > 0 
+      AND WO_TAB(V_WO_INDEX).WAREHOUSE = HD.WAREHOUSE
+      THEN 
+                R_MRP := NULL;
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_MRP.DUE_DATE := HD.DUE_DATE;
+                R_MRP.LOT_NO   := WO_TAB(V_WO_INDEX).LOT_NO;
+                R_MRP.PO_NO    := 'STOCK';
+                R_MRP.PEGGING_TYPE := NULL;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := 'STOCK';                
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                R_MRP.QTY               := CASE WHEN HD.DEMAND_QTY >= WO_TAB(V_WO_INDEX).AVAILABLE_QTY 
+                                                THEN WO_TAB(V_WO_INDEX).AVAILABLE_QTY
+                                                ELSE HD.DEMAND_QTY
+                                                End;
+                V_QTY               := R_MRP.QTY;
+                HD.DEMAND_QTY    := HD.DEMAND_QTY-R_MRP.QTY;
+                WO_TAB(V_WO_INDEX).AVAILABLE_QTY := WO_TAB(V_WO_INDEX).AVAILABLE_QTY - R_MRP.QTY;
+                WO_TAB(V_WO_INDEX).ALLOCATED_QTY := WO_TAB(V_WO_INDEX).ALLOCATED_QTY + R_MRP.QTY;
+                R_Mrp.Allocate_From    := 'STOCK';
+                
+                R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+                R_MRP.LEVEL_CODE      :=  ITEM_TAB(IM).LOW_LEVEL_CODE;
+                
+                R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+--                CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+--                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+--                                                ELSE 'S'
+--                                                END;
+                R_Mrp.Parent_Pegging_Type    :=  Nvl(Hd.Parent_Pegging_Type,R_Mrp.Pegging_Type);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_MRP.parent_order_line_no    :=  NVL(HD.parent_order_line_no,R_MRP.line_no);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+--                R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);                                
+                R_MRP.FINAL_WORK_order_No    :=  'STOCK';
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+                
+-- REDUCING BALANCE FROM PREV RUN AND AVAILABLE STOCK, START
+If Stock_Tab.Exists(Hd.Item_No||'~'||1) Then
+  For I In 1..1000
+  Loop
+    If Stock_Tab.Exists(Hd.Item_No||'~'||I) Then
+      If R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+        And Stock_Tab(Hd.Item_No||'~'||I).Rev_No = Hd.Item_Revision_No 
+        And Stock_Tab(Hd.Item_No||'~'||I).LOT_NO  = R_MRP.LOT_NO
+        And Stock_Tab(Hd.Item_No||'~'||I).Available_Qty >0 
+      Then
+        Stock_Tab(Hd.Item_No||'~'||I).Available_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||I).Available_Qty-R_Mrp.QTY;
+        Stock_Tab(Hd.Item_No||'~'||I).ALLOTED_QTY 
+              := Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty+R_Mrp.Qty;
+      Elsif R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+     --And Stock_Tab(Hd.Item_No||'~'||I).Rev_No = Hd.Item_Revision_No 
+        And Stock_Tab(Hd.Item_No||'~'||I).LOT_NO  = R_MRP.LOT_NO
+        And Stock_Tab(Hd.Item_No||'~'||I).Available_Qty >0 
+      Then
+        Stock_Tab(Hd.Item_No||'~'||I).Available_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||I).Available_Qty-R_Mrp.QTY;
+        Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty+R_Mrp.Qty;
+--              Display('No rev no available '||Stock_Tab(Hd.Item_No||'~'||I).Available_Qty );
+--              Display('No rev no alloted '||Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty );
+      END IF;
+    END IF;
+  END LOOP;
+END IF;
+V_Index := 'STOCK'||'~'||Hd.Order_No||'~'||Hd.Line_No||'~'||1;
+IF Prev_Run_Tab.Exists(V_Index) 
+Then
+FOR I IN 1..500
+        Loop
+      If Prev_Run_Tab(V_Index).LOT_NO = R_MRP.LOT_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty >= V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+      THEN
+      Prev_Run_Tab(V_Index).Available_Qty := 
+          Prev_Run_Tab(V_Index).Available_Qty -V_Qty;
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+V_Qty;
+      V_Qty := 0;
+      ElsIF Prev_Run_Tab(V_Index).LOT_NO = R_MRP.LOT_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty < V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+      THEN  
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+
+              Prev_Run_Tab(V_Index).Available_Qty;
+      Prev_Run_Tab(V_Index).Available_Qty := 0;
+      V_Qty := V_Qty-Prev_Run_Tab(V_Index).Available_Qty ;
+    End If;
+V_Index := 'STOCK'||'~'||Hd.Order_No||'~'||Hd.Line_No||'~'||(I+1);
+  EXIT WHEN V_Qty <= 0 OR NOT Prev_Run_Tab.Exists(V_Index);
+  END LOOP;
+END IF;
+-- REDUCING BALANCE FROM PREV RUN AND AVAILABLE STOCK, END 
+--                LP_INSERT_ALLOCATION(R_MRP);
+            H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+                EXIT WHEN HD.DEMAND_QTY <= 0;
+      END IF;          
+    ELSE 
+      EXIT;
+    END IF;
+  END LOOP;--1..100
+--  WO_TAB.DELETE;
+-- ALLOCATING WO COMPLETED QTY, END
+
+-- ALLOCATING WO QTY, START
+          IF HD.DEMAND_QTY>0 
+          THEN
+            IF WO_BAL_TAB.EXISTS(HD.WORK_ORDER_NO) 
+            THEN
+            IF HD.DEMAND_QTY>0 AND WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY > 0 
+            THEN
+                R_MRP := NULL; 
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_MRP.DUE_DATE := HD.DUE_DATE;
+                R_MRP.LOT_NO   := NULL;
+                R_MRP.PO_NO    := NULL;
+                R_MRP.PEGGING_TYPE := NULL;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := HD.WORK_ORDER_NO;                
+                R_MRP.WO_RELEASE_DATE := WO_BAL_TAB(HD.WORK_ORDER_NO).WO_RELEASE_DATE ;
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                R_MRP.QTY               := CASE WHEN HD.DEMAND_QTY >= WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY 
+                                                THEN WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY
+                                                ELSE HD.DEMAND_QTY
+                                                End;
+                V_Qty := R_MRP.QTY;                                                
+                HD.DEMAND_QTY    := HD.DEMAND_QTY-R_MRP.QTY;
+                WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY := WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY - R_MRP.QTY;
+                WO_BAL_TAB(HD.WORK_ORDER_NO).ALLOCATED_QTY := WO_BAL_TAB(HD.WORK_ORDER_NO).ALLOCATED_QTY + R_MRP.QTY;
+                R_Mrp.Allocate_From    := 'WO';
+
+                R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+                R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+                R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+--                CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+--                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+--                                                ELSE 'S'
+--                                                END;
+                R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+--                R_MRP.FINAL_WORK_order_No    :=  CASE WHEN HD.ALLOCATION_TYPE = 'SO_WO' THEN R_MRP.WORK_ORDER_NO
+--                                                          ELSE HD.FINAL_WORK_order_No END;                                                
+                R_MRP.FINAL_WORK_order_No    :=  HD.WORK_ORDER_NO;                                                           
+
+                
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+-- REDUCING WO BALANCE FROM PREV RUN , START
+V_Index := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+IF Prev_Run_Tab.Exists(V_Index) 
+Then
+  For I In 1..500
+  Loop
+      If Prev_Run_Tab(V_Index).WORK_ORDER_NO = R_Mrp.WORK_ORDER_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty >= V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+      THEN
+      Prev_Run_Tab(V_Index).Available_Qty := 
+          Prev_Run_Tab(V_Index).Available_Qty -V_Qty;
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+V_Qty;
+      V_Qty := 0;
+      Elsif
+      Prev_Run_Tab(V_Index).WORK_ORDER_NO = R_Mrp.WORK_ORDER_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty < V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+        then
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+
+              Prev_Run_Tab(V_Index).Available_Qty;
+      Prev_Run_Tab(V_Index).Available_Qty := 0;
+      --V_Qty := V_Qty-Prev_Run_Tab('WO'||'~'||R_MRP.WORK_ORDER_NO||'~'||I).Available_Qty ;
+      V_Qty := V_Qty-Prev_Run_Tab(V_Index).Available_Qty ;
+    End If;
+V_Index := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(I+1);
+  EXIT WHEN V_Qty <= 0 OR NOT Prev_Run_Tab.Exists(V_Index);
+  END LOOP;
+End If;
+-- REDUCING WO BALANCE FROM PREV RUN , END                
+                --LP_INSERT_ALLOCATION(R_MRP);
+                H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+                
+--                EXIT WHEN HD.DEMAND_QTY <= 0;
+            END IF;
+          END IF; -- WO_BAL_TAB(HD.WORK_ORDER_NO).EXISTS 
+          END IF;
+-- ALLOCATING WO QTY, END          
+          END IF; --HD.SO_WO_LINK = 'Y' 
+--COPY START 
+--COPY END
+
+        ELSIF HD.ALLOCATION_TYPE = 'WO_CO' --WO_CO 
+        THEN
+--
+--INSERTING ISSUED RECORD,START        
+--
+
+  IF WO_ISSUED_TAB.EXISTS(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO) 
+  THEN
+    R_MRP.QTY := least(WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY , HD.DEMAND_QTY); 
+    
+    IF R_MRP.QTY = WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY
+    THEN 
+      WO_ISSUED_TAB.DELETE(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO);
+    ELSE
+      WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY := 
+      WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY-R_MRP.QTY;
+    END IF;
+    
+    HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;   
+                R_MRP := NULL;
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_MRP.DUE_DATE := HD.DUE_DATE;
+                R_MRP.LOT_NO   := NULL;
+                R_MRP.PO_NO    := 'ISSUED';
+                R_MRP.PEGGING_TYPE := NULL;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := 'ISSUED'; 
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                V_QTY               := R_MRP.QTY;
+                R_Mrp.Allocate_From    := 'ISSUED';
+
+--                R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--                R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+                R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+                R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+                R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+--                CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+--                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+--                                                ELSE 'S'
+--                                                END;
+                R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+                R_MRP.FINAL_WORK_order_No    :=  HD.FINAL_WORK_order_No;                                                
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;                
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+If Wo_Line_Qty_Tab.Exists(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) Then
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY := R_MRP.QTY;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+                
+       				  --LP_INSERT_ALLOCATION(R_MRP);
+                       H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+    
+  END IF;
+--
+--INSERTING ISSUED RECORD,END
+--
+          FOR J IN 
+          (
+          SELECT 
+              WORK_ORDER_NO
+              FROM WO_PARENT_WO WOP
+              WHERE WOP.PARENT_WORK_ORDER_NO = HD.ORDER_NO
+                AND WOP.ITEM_NO = HD.ITEM_NO
+                AND 
+                    (
+                    (WOP.ITEM_REV_NO = HD.ITEM_REVISION_NO AND R_APP_SETTINGS.REV_NO_REQUIRED_MAT_PLANNING = 'Y')
+                    OR 
+                    R_APP_SETTINGS.REV_NO_REQUIRED_MAT_PLANNING = 'N'
+                    )
+          )
+          LOOP
+          HD.WORK_ORDER_NO := J.WORK_ORDER_NO;
+-- 'WO_CO',ALLOCATING WO COMPLETED QTY, START
+  FOR I IN 1..500
+  LOOP
+    V_WO_INDEX := HD.WORK_ORDER_NO||'~'||I;  
+    IF WO_TAB.EXISTS(V_WO_INDEX) 
+    THEN 
+      IF WO_TAB(V_WO_INDEX).AVAILABLE_QTY > 0 
+      AND WO_TAB(V_WO_INDEX).WAREHOUSE = HD.WAREHOUSE      
+      Then 
+                R_MRP := NULL;
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_MRP.DUE_DATE := HD.DUE_DATE;
+                R_MRP.LOT_NO   := WO_TAB(V_WO_INDEX).LOT_NO;
+                R_MRP.PO_NO    := 'STOCK';
+                R_MRP.PEGGING_TYPE := NULL;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := 'STOCK'; 
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                R_MRP.QTY               := CASE WHEN HD.DEMAND_QTY >= WO_TAB(V_WO_INDEX).AVAILABLE_QTY 
+                                                THEN WO_TAB(V_WO_INDEX).AVAILABLE_QTY
+                                                ELSE HD.DEMAND_QTY
+                                                End;
+                V_QTY               := R_MRP.QTY;
+                HD.DEMAND_QTY    := HD.DEMAND_QTY-R_MRP.QTY;
+                WO_TAB(V_WO_INDEX).AVAILABLE_QTY := WO_TAB(V_WO_INDEX).AVAILABLE_QTY - R_MRP.QTY;
+                WO_TAB(V_WO_INDEX).ALLOCATED_QTY := WO_TAB(V_WO_INDEX).ALLOCATED_QTY + R_MRP.QTY;
+                R_Mrp.Allocate_From    := 'STOCK';
+
+--                R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--                R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+                R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+                R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+                R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+--                CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+--                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+--                                                ELSE 'S'
+--                                                END;
+                R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+                R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);                
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;                
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY := R_MRP.QTY;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+                
+-- REDUCING BALANCE FROM PREV RUN AND AVAILABLE STOCK, START
+If Stock_Tab.Exists(Hd.Item_No||'~'||1) Then
+  For I In 1..1000
+  Loop
+    If Stock_Tab.Exists(Hd.Item_No||'~'||I) Then
+      If R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+        And Stock_Tab(Hd.Item_No||'~'||I).Rev_No = Hd.Item_Revision_No 
+        And Stock_Tab(Hd.Item_No||'~'||I).LOT_NO  = R_MRP.LOT_NO
+        And Stock_Tab(Hd.Item_No||'~'||I).Available_Qty >0 
+      Then
+
+        Stock_Tab(Hd.Item_No||'~'||I).Available_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||I).Available_Qty-R_Mrp.QTY;
+        Stock_Tab(Hd.Item_No||'~'||I).ALLOTED_QTY 
+              := Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty+R_Mrp.Qty;
+      Elsif R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+     --And Stock_Tab(Hd.Item_No||'~'||I).Rev_No = Hd.Item_Revision_No 
+        And Stock_Tab(Hd.Item_No||'~'||I).LOT_NO  = R_MRP.LOT_NO
+        And Stock_Tab(Hd.Item_No||'~'||I).Available_Qty >0 
+      Then
+        Stock_Tab(Hd.Item_No||'~'||I).Available_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||I).Available_Qty-R_Mrp.QTY;
+        Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty+R_Mrp.Qty;
+--              Display('No rev no available '||Stock_Tab(Hd.Item_No||'~'||I).Available_Qty );
+--              Display('No rev no alloted '||Stock_Tab(Hd.Item_No||'~'||I).Alloted_Qty );
+      END IF;
+    END IF;
+  END LOOP;
+END IF;
+V_Index := 'STOCK'||'~'||Hd.Order_No||'~'||Hd.Line_No||'~'||1;
+IF Prev_Run_Tab.Exists(V_Index) 
+Then
+FOR I IN 1..500
+        Loop
+      If Prev_Run_Tab(V_Index).LOT_NO = R_MRP.LOT_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty >= V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+      THEN
+      Prev_Run_Tab(V_Index).Available_Qty := 
+          Prev_Run_Tab(V_Index).Available_Qty -V_Qty;
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+V_Qty;
+      V_Qty := 0;
+      ElsIF Prev_Run_Tab(V_Index).LOT_NO = R_MRP.LOT_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty < V_Qty
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+      THEN  
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+
+              Prev_Run_Tab(V_Index).Available_Qty;
+      Prev_Run_Tab(V_Index).Available_Qty := 0;
+      V_Qty := V_Qty-Prev_Run_Tab(V_Index).Available_Qty ;
+    End If;
+V_Index := 'STOCK'||'~'||Hd.Order_No||'~'||Hd.Line_No||'~'||(I+1);
+  EXIT WHEN V_Qty <= 0 OR NOT Prev_Run_Tab.Exists(V_Index);
+  END LOOP;
+END IF;
+-- REDUCING BALANCE FROM PREV RUN AND AVAILABLE STOCK, END 
+                --LP_INSERT_ALLOCATION(R_MRP);
+                H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;                
+                EXIT WHEN HD.DEMAND_QTY <= 0;
+      END IF;          
+    ELSE 
+      EXIT;
+    END IF;
+  END LOOP;--1..100
+--  WO_TAB.DELETE;
+-- 'WO_CO',ALLOCATING WO COMPLETED QTY, END
+
+-- WO_CO,ALLOCATING WO QTY, START
+          IF HD.DEMAND_QTY>0 
+          THEN
+            IF WO_BAL_TAB.EXISTS(HD.WORK_ORDER_NO) 
+            THEN
+            IF HD.DEMAND_QTY>0 AND WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY > 0 
+            THEN
+                R_MRP := NULL;
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_MRP.DUE_DATE := HD.DUE_DATE;
+                R_MRP.LOT_NO   := NULL;
+                R_MRP.PO_NO    := NULL;
+                R_MRP.PEGGING_TYPE := NULL;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := HD.WORK_ORDER_NO;                
+                R_MRP.WO_RELEASE_DATE := WO_BAL_TAB(HD.WORK_ORDER_NO).WO_RELEASE_DATE ;                                                          
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                R_MRP.QTY               := CASE WHEN HD.DEMAND_QTY >= WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY 
+                                                THEN WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY
+                                                ELSE HD.DEMAND_QTY
+                                                End;
+                V_Qty := R_MRP.QTY;  
+                HD.DEMAND_QTY    := HD.DEMAND_QTY-R_MRP.QTY;
+                WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY := WO_BAL_TAB(HD.WORK_ORDER_NO).AVAILABLE_QTY - R_MRP.QTY;
+                WO_BAL_TAB(HD.WORK_ORDER_NO).ALLOCATED_QTY := WO_BAL_TAB(HD.WORK_ORDER_NO).ALLOCATED_QTY + R_MRP.QTY;
+                R_Mrp.Allocate_From    := 'WO';
+
+--                R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--                R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+                R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+                R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+                R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+--                CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+--                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+--                                                ELSE 'S'
+--                                                END;
+                R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+                R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);                
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty := R_Mrp.Qty;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+
+                
+-- REDUCING WO BALANCE FROM PREV RUN , START
+V_Index := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+IF Prev_Run_Tab.Exists(V_Index) 
+Then
+  For I In 1..500
+  Loop
+      If Prev_Run_Tab(V_Index).WORK_ORDER_NO = R_Mrp.WORK_ORDER_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty >= V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+      THEN
+      Prev_Run_Tab(V_Index).Available_Qty := 
+          Prev_Run_Tab(V_Index).Available_Qty -V_Qty;
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+V_Qty;
+      V_Qty := 0;
+      Elsif Prev_Run_Tab(V_Index).WORK_ORDER_NO = R_Mrp.WORK_ORDER_NO 
+        and Prev_Run_Tab(V_Index).Available_Qty < V_Qty 
+        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+        then
+      Prev_Run_Tab(V_Index).ALLOCATED_QTY := 
+          Prev_Run_Tab(V_Index).ALLOCATED_QTY+
+              Prev_Run_Tab(V_Index).Available_Qty;
+      --V_Qty := V_Qty-Prev_Run_Tab('WO'||'~'||R_MRP.WORK_ORDER_NO||'~'||I).Available_Qty ;
+        V_Qty := V_Qty-Prev_Run_Tab(V_Index).Available_Qty ;
+        Prev_Run_Tab(V_Index).Available_Qty := 0;        
+    End If;
+V_Index := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(I+1);
+  EXIT WHEN V_Qty <= 0 OR NOT Prev_Run_Tab.Exists(V_Index);
+  END LOOP;
+End If;
+-- REDUCING WO BALANCE FROM PREV RUN , END                
+                --LP_INSERT_ALLOCATION(R_MRP);
+                H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+--                EXIT WHEN HD.DEMAND_QTY <= 0;
+            END IF;
+          END IF; -- WO_BAL_TAB(HD.WORK_ORDER_NO).EXISTS 
+          END IF;
+-- WO_CO,ALLOCATING WO QTY, END          
+
+EXIT WHEN HD.DEMAND_QTY <= 0;
+END LOOP;
+        End If; -- HD.ALLOCATION_TYPE = 'SO_WO' or 'WO_CO'
+--COPY START 
+          IF (HD.DEMAND_QTY > 0 OR HD.MAIN_QTY > 0 )
+              AND 
+             (HD.WITH_IN_WINDOW_DAYS = 'Y' or  HD.ORDER_SOFT_OR_HARD = 'H')
+          THEN
+HD.DEMAND_QTY := HD.DEMAND_QTY + HD.MAIN_QTY;
+
+--
+--INSERTING ISSUED RECORD IN PREV RUN,START
+--
+IF HD.ALLOCATION_TYPE = 'WO_CO' 
+THEN
+  IF WO_ISSUED_TAB.EXISTS(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO) 
+  THEN
+    R_MRP.QTY := least(WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY , HD.DEMAND_QTY); 
+    HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;   
+    IF R_MRP.QTY = WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY
+    THEN 
+      WO_ISSUED_TAB.DELETE(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO);
+    ELSE
+    WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY :=
+      WO_ISSUED_TAB(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).BALANCE_IN_ISSUED_QTY-R_MRP.QTY;
+    END IF;
+                R_MRP := NULL; 
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_MRP.DUE_DATE := HD.DUE_DATE;
+                R_MRP.LOT_NO   := NULL;
+                R_MRP.PO_NO    := 'ISSUED';
+                R_MRP.PEGGING_TYPE := NULL;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := 'ISSUED'; 
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                V_QTY               := R_MRP.QTY;
+                R_Mrp.Allocate_From    := 'ISSUED';
+
+--                R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--                R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+                R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+                R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+                R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+--                CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+--                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+--                                                ELSE 'S'
+--                                                END;
+                R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+                R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);                
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty := R_Mrp.Qty;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+                --LP_INSERT_ALLOCATION(R_MRP);                
+                H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;                 
+    
+  END IF;
+END IF;  
+--
+--INSERTING ISSUED RECORD IN PREV RUN,END
+--
+
+
+--STOCK ALLOCATION FROM PREV RUN,START
+V_Qty := HD.DEMAND_QTY;           
+V_INDEX := 'STOCK'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+IF PREV_RUN_TAB.EXISTS(V_INDEX) 
+THEN
+	FOR I IN 1..500
+	LOOP
+	If Prev_Run_Tab(V_Index).Available_Qty >0 
+       and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+       and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+    Then
+		V_LOWER_INDEX := HD.ITEM_NO||'~'||1;
+			IF STOCK_TAB.EXISTS(V_LOWER_INDEX) 
+			THEN
+				FOR J IN 1..500
+				LOOP
+				    IF Stock_Tab(V_LOWER_INDEX).LOT_NO = Prev_Run_Tab(V_Index).LOT_NO 
+						And Stock_Tab(V_LOWER_INDEX).Available_Qty >0 
+            AND Prev_Run_Tab(V_Index).Available_Qty >0
+						AND R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+                        and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+                        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+						And Stock_Tab(V_LOWER_INDEX).Rev_No = Hd.Item_Revision_No 
+    			    THEN
+                        R_MRP := NULL;
+						R_MRP.QTY	:= CASE WHEN Prev_Run_Tab(V_Index).Available_Qty >= Stock_Tab(V_LOWER_INDEX).Available_Qty 
+											THEN Stock_Tab(V_LOWER_INDEX).Available_Qty
+											ELSE Prev_Run_Tab(V_Index).Available_Qty
+											End;
+						R_MRP.QTY	:= LEAST(R_MRP.QTY,HD.DEMAND_QTY);
+            
+          V_QTY := R_MRP.QTY;
+          HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;
+          V_SEQ_NO       := V_SEQ_NO+1;
+          R_MRP.SEQ_NO   := V_SEQ_NO;
+          R_MRP.ORDER_NO := HD.ORDER_NO;
+          R_MRP.LINE_NO  := HD.LINE_NO;
+          R_MRP.ITEM_NO  := HD.ITEM_NO;
+          R_Mrp.Due_Date := Hd.Due_Date;
+          R_Mrp.Lot_No   := Stock_Tab(V_Lower_Index).Lot_No;
+          
+          R_MRP.PO_NO    := 'STOCK';
+          R_MRP.PEGGING_TYPE := NULL;
+          R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+          R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+          R_MRP.WORK_ORDER_NO    := 'STOCK';                
+          R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+          R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+          R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+          R_Mrp.Pegging_Within_Lead_Time := Hd.With_In_Window_Days;
+          R_Mrp.Allocate_From    := 'STOCK';
+          Stock_Tab(V_Lower_Index).Available_Qty :=  Stock_Tab(V_Lower_Index).Available_Qty - R_Mrp.Qty;
+          Stock_Tab(V_Lower_Index).Alloted_Qty :=  Stock_Tab(V_Lower_Index).Alloted_Qty + R_Mrp.Qty;          
+          Prev_Run_Tab(V_Index).Available_Qty :=  Prev_Run_Tab(V_Index).Available_Qty - R_Mrp.Qty;
+          Prev_Run_Tab(V_Index).Allocated_Qty :=  Prev_Run_Tab(V_Index).Allocated_Qty + R_Mrp.Qty;          
+
+--          R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--          R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+          R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+          R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+          R_MRP.PEGGING_TYPE      :=  CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+                                                HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+                                          ELSE 'S'
+                                          END;
+          R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+          R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+          R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+          R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+          R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+          R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);          
+          R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+
+--
+-- START ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+L_V_INDEX := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+  IF PREV_RUN_TAB.EXISTS(L_V_INDEX) --5 START
+  THEN
+    	FOR I IN 1..500 --4 LOOP START
+    	LOOP
+          L_V_LOWER_INDEX := Prev_Run_Tab(L_V_INDEX).WORK_ORDER_NO;
+          FOR J IN 1..500 --3 LOOP START
+          LOOP
+            L_V_WO_INDEX := L_V_LOWER_INDEX||'~'||J;  
+              IF WO_TAB.EXISTS(L_V_WO_INDEX) --2 START
+              THEN
+                      IF WO_TAB(L_V_WO_INDEX).AVAILABLE_QTY > 0 --1 START
+                      AND WO_TAB(L_V_WO_INDEX).LOT_NO = Stock_Tab(V_Lower_Index).Lot_No
+                      Then 
+                        WO_TAB(L_V_WO_INDEX).AVAILABLE_QTY := 
+                        WO_TAB(L_V_WO_INDEX).AVAILABLE_QTY-R_MRP.QTY;
+                        WO_TAB(L_V_WO_INDEX).ALLOCATED_QTY := 
+                        WO_TAB(L_V_WO_INDEX).ALLOCATED_QTY + R_MRP.QTY;                              
+                      END IF;--1 END
+               END IF; --2 END
+            END LOOP;--3 LOOP END   
+         END LOOP;   --4 LOOP END
+     END IF;--5 END
+--     
+-- END    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+                
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty := R_Mrp.Qty;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+          
+-- LP_INSERT_ALLOCATION(R_MRP);
+    H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+          V_LOWER_INDEX := HD.ITEM_NO||'~'||(J+1);
+
+            
+					Elsif 
+						Stock_Tab(V_LOWER_INDEX).LOT_NO = Prev_Run_Tab(V_Index).LOT_NO 
+						And Stock_Tab(V_LOWER_INDEX).Available_Qty >0 
+                        AND Prev_Run_Tab(V_Index).Available_Qty >0 
+						AND R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+                        AND nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+                        AND nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+					Then
+                        R_MRP := NULL;
+						R_MRP.QTY	:= CASE WHEN Prev_Run_Tab(V_Index).Available_Qty >= Stock_Tab(V_LOWER_INDEX).Available_Qty 
+											THEN Stock_Tab(V_LOWER_INDEX).Available_Qty
+											ELSE Prev_Run_Tab(V_Index).Available_Qty
+											End;
+						R_MRP.QTY	:= LEAST(R_MRP.QTY,HD.DEMAND_QTY);
+
+          V_QTY := R_MRP.QTY;
+          HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;
+          V_SEQ_NO       := V_SEQ_NO+1;
+          R_MRP.SEQ_NO   := V_SEQ_NO;
+          R_MRP.ORDER_NO := HD.ORDER_NO;
+          R_MRP.LINE_NO  := HD.LINE_NO;
+          R_MRP.ITEM_NO  := HD.ITEM_NO;
+          R_Mrp.Due_Date := Hd.Due_Date;
+          R_Mrp.Lot_No   := Stock_Tab(V_Lower_Index).Lot_No;
+          
+          R_MRP.PO_NO    := 'STOCK';
+          R_MRP.PEGGING_TYPE := NULL;
+          R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+          R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+          R_MRP.WORK_ORDER_NO    := 'STOCK';                
+          R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+          R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+          R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+          R_Mrp.Pegging_Within_Lead_Time := Hd.With_In_Window_Days;
+          R_Mrp.Allocate_From    := 'STOCK';
+          Stock_Tab(V_Lower_Index).Available_Qty :=  Stock_Tab(V_Lower_Index).Available_Qty - R_Mrp.Qty;
+          Stock_Tab(V_Lower_Index).Alloted_Qty :=  Stock_Tab(V_Lower_Index).Alloted_Qty + R_Mrp.Qty;          
+          Prev_Run_Tab(V_Index).Available_Qty :=  Prev_Run_Tab(V_Index).Available_Qty - R_Mrp.Qty;
+          Prev_Run_Tab(V_Index).Allocated_Qty :=  Prev_Run_Tab(V_Index).Allocated_Qty + R_Mrp.Qty;          
+
+--          R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--          R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+          R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+          R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+          R_MRP.PEGGING_TYPE      :=  CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+                                                HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+                                          ELSE 'S'
+                                          END;
+          R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+          R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+          R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+          R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+          R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+          R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);          
+          R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+--
+-- START ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+L_V_INDEX := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+  IF PREV_RUN_TAB.EXISTS(L_V_INDEX) --5 START
+  THEN
+    	FOR I IN 1..500 --4 LOOP START
+    	LOOP
+          L_V_LOWER_INDEX := Prev_Run_Tab(L_V_INDEX).WORK_ORDER_NO;
+          FOR J IN 1..500 --3 LOOP START
+          LOOP
+            L_V_WO_INDEX := L_V_LOWER_INDEX||'~'||J;  
+              IF WO_TAB.EXISTS(L_V_WO_INDEX) --2 START
+              THEN
+                      IF WO_TAB(L_V_WO_INDEX).AVAILABLE_QTY > 0 --1 START
+                      AND WO_TAB(L_V_WO_INDEX).LOT_NO = Stock_Tab(V_Lower_Index).Lot_No
+                      Then 
+                        WO_TAB(L_V_WO_INDEX).AVAILABLE_QTY := 
+                        WO_TAB(L_V_WO_INDEX).AVAILABLE_QTY-R_MRP.QTY;
+                        WO_TAB(L_V_WO_INDEX).ALLOCATED_QTY := 
+                        WO_TAB(L_V_WO_INDEX).ALLOCATED_QTY + R_MRP.QTY;                              
+                      END IF;--1 END
+               ELSE 
+               EXIT;
+               END IF; --2 END
+            END LOOP;--3 LOOP END   
+          L_V_INDEX :=  'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(I+1);
+          EXIT WHEN NOT Prev_Run_Tab.EXISTS(L_V_INDEX) ;
+         END LOOP;   --4 LOOP END
+     END IF;--5 END
+--     
+-- END    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+
+          
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty := R_Mrp.Qty;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+
+          
+				--  LP_INSERT_ALLOCATION(R_MRP);
+                 H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+				End If;
+                V_LOWER_INDEX := HD.ITEM_NO||'~'||(J+1);                    
+				EXIT WHEN NOT STOCK_TAB.EXISTS(V_LOWER_INDEX) or HD.DEMAND_QTY <= 0;
+				End Loop;--1..100,STOCK_TAB.EXISTS(V_LOWER_INDEX)
+			End If;--IF STOCK_TAB.EXISTS(V_LOWER_INDEX)
+     END IF; --If Prev_Run_Tab(V_Index).Available_Qty >0
+	V_INDEX := 'STOCK'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(i+1);
+	EXIT WHEN NOT Prev_Run_Tab.EXISTS(V_INDEX) or HD.DEMAND_QTY <= 0;	 
+	END LOOP; --1..100 ,PREV_RUN_TAB
+END IF;-- IF PREV_RUN_TAB.EXISTS(V_INDEX) 
+--STOCK ALLOCATION FROM PREV RUN,END
+--TODAY,START
+-- ALLOCATING WO COMPLETED QTY IN PREV RUN, START
+V_INDEX := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+  IF PREV_RUN_TAB.EXISTS(V_INDEX) 
+  THEN
+    	FOR I IN 1..500
+    	LOOP
+/*        	If Prev_Run_Tab(V_Index).Available_Qty >0 
+          Then*/
+
+        if nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+        and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+          then          
+
+            V_LOWER_INDEX := Prev_Run_Tab(V_Index).WORK_ORDER_NO;
+            FOR J IN 1..500
+            LOOP
+            V_WO_INDEX := V_LOWER_INDEX||'~'||J;  
+                IF WO_TAB.EXISTS(V_WO_INDEX) 
+                THEN
+                        IF WO_TAB(V_WO_INDEX).AVAILABLE_QTY > 0 
+                        Then
+                          R_MRP := NULL;
+                          V_SEQ_NO       := V_SEQ_NO+1;
+                          R_MRP.SEQ_NO   := V_SEQ_NO;
+                          R_MRP.ORDER_NO := HD.ORDER_NO;
+                          R_MRP.LINE_NO  := HD.LINE_NO;
+                          R_MRP.ITEM_NO  := HD.ITEM_NO;
+                          R_MRP.DUE_DATE := HD.DUE_DATE;
+                          R_MRP.LOT_NO   := WO_TAB(V_WO_INDEX).LOT_NO;
+                          R_MRP.PO_NO    := 'STOCK';
+                          R_MRP.PEGGING_TYPE := NULL;
+                          R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                          R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                          R_MRP.WORK_ORDER_NO    := 'STOCK';                
+                          R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                          R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                          R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                          R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+--                          R_MRP.QTY               := LEAST(HD.DEMAND_QTY , WO_TAB(V_WO_INDEX).AVAILABLE_QTY); 
+                          R_MRP.QTY               := LEAST(HD.DEMAND_QTY , WO_TAB(V_WO_INDEX).AVAILABLE_QTY,PREV_RUN_TAB(V_INDEX).QTY); 
+                          PREV_RUN_TAB(V_INDEX).QTY := PREV_RUN_TAB(V_INDEX).QTY-R_MRP.QTY;
+                          HD.DEMAND_QTY           := HD.DEMAND_QTY-R_MRP.QTY;
+                          WO_TAB(V_WO_INDEX).AVAILABLE_QTY := WO_TAB(V_WO_INDEX).AVAILABLE_QTY - R_MRP.QTY;
+                          WO_TAB(V_WO_INDEX).ALLOCATED_QTY := WO_TAB(V_WO_INDEX).ALLOCATED_QTY + R_MRP.QTY;
+                          R_Mrp.Allocate_From     := 'STOCK';
+--                          R_Mrp.HIERARCHY_LEVEL   := ITEM_TAB(IM).Low_Level_Code;
+--                          R_MRP.LEVEL_CODE        :=  ITEM_TAB(IM).LOW_LEVEL_CODE;
+                          R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+                          R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+                          R_MRP.PEGGING_TYPE      := HD.ORDER_SOFT_OR_HARD;
+                          R_Mrp.Parent_Pegging_Type     :=  Nvl(Hd.Parent_Pegging_Type,R_Mrp.Pegging_Type);
+                          R_Mrp.Parent_Order_No         :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                          R_MRP.parent_order_line_no    :=  NVL(HD.parent_order_line_no,R_MRP.line_no);                
+                          R_Mrp.Parent_ITEM_No          :=  Hd.Parent_ITEM_No;
+                          R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+                          R_MRP.FINAL_WORK_order_No     :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);                                
+                          R_MRP.PEGGING_TYPE      :=  CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+                                                            HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+                                                                ELSE 'S'
+                                                            END;                          
+                          R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+If Wo_Line_Qty_Tab.Exists(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) Then
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY := R_MRP.QTY;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+                
+--LP_INSERT_ALLOCATION(R_MRP);
+H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+
+-- REDUCING BALANCE FROM AVAILABLE STOCK, START
+If Stock_Tab.Exists(Hd.Item_No||'~'||1) Then
+  For K In 1..1000
+  Loop
+      If Stock_Tab.Exists(Hd.Item_No||'~'||K) Then
+      If R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+        And Stock_Tab(Hd.Item_No||'~'||K).Rev_No = Hd.Item_Revision_No 
+        And Stock_Tab(Hd.Item_No||'~'||K).LOT_NO  = R_MRP.LOT_NO
+        And Stock_Tab(Hd.Item_No||'~'||K).Available_Qty >0 
+      Then
+        Stock_Tab(Hd.Item_No||'~'||K).Available_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||K).Available_Qty-R_Mrp.QTY;
+        Stock_Tab(Hd.Item_No||'~'||K).ALLOTED_QTY 
+              := Stock_Tab(Hd.Item_No||'~'||K).Alloted_Qty+R_Mrp.Qty;
+      Elsif R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+        And Stock_Tab(Hd.Item_No||'~'||K).LOT_NO  = R_MRP.LOT_NO
+        And Stock_Tab(Hd.Item_No||'~'||K).Available_Qty >0 
+      Then
+        Stock_Tab(Hd.Item_No||'~'||K).Available_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||K).Available_Qty-R_Mrp.QTY;
+        Stock_Tab(Hd.Item_No||'~'||K).Alloted_Qty 
+              := Stock_Tab(Hd.Item_No||'~'||K).Alloted_Qty+R_Mrp.Qty;
+      END IF;
+    END IF; -- STOCK INDEX EXISTS             
+  END LOOP;-- 1000 LOOP FOR STOCK
+END IF;-- STOCK   INDEX CHECKING
+-- REDUCING BALANCE FROM AVAILABLE STOCK, END
+END IF;
+                ELSE
+                  EXIT;
+                END IF;
+            END LOOP;
+          END IF;-- parent order and line checlking            
+/*          END IF; */--If Prev_Run_Tab(V_Index).Available_Qty >0
+         V_INDEX :=  'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(I);
+      EXIT WHEN NOT Prev_Run_Tab.EXISTS(V_INDEX) or HD.DEMAND_QTY <= 0;	          
+      END LOOP; --100 LOOP
+  END IF; --PREV_RUN_TAB.EXISTS(V_INDEX),-- CHECKING WO-ORDER-LINE INDEX 
+-- ALLOCATING WO COMPLETED QTY IN PREV RUN, END
+
+--TODAY,END
+
+--WO ALLOCATION FROM PREV RUN,START
+V_Qty := HD.DEMAND_QTY;           
+V_INDEX := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+IF PREV_RUN_TAB.EXISTS(V_INDEX) 
+THEN
+	FOR I IN 1..500
+	LOOP
+	If Prev_Run_Tab(V_Index).Available_Qty >0 
+     and nvl(Prev_Run_Tab(V_Index).parent_order_no ,HD.Order_No) = nvl(hd.parent_order_no ,HD.Order_No)
+     and nvl(Prev_Run_Tab(V_Index).parent_order_line_no,HD.line_No) = nvl(hd.parent_order_line_no,HD.line_No)
+   Then
+	V_LOWER_INDEX := Prev_Run_Tab(V_Index).WORK_ORDER_NO;
+			IF WO_BAL_TAB.EXISTS(V_LOWER_INDEX) 
+			THEN
+				FOR J IN 1..500
+				LOOP
+				    IF WO_BAL_TAB(V_LOWER_INDEX).Available_Qty >0 
+							AND R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+							And WO_BAL_TAB(V_LOWER_INDEX).ITEM_REVISION_NO = Hd.Item_Revision_No 
+							And WO_BAL_TAB(V_LOWER_INDEX).ITEM_NO = Hd.Item_No 
+    			    THEN
+                        R_MRP := NULL; 
+						R_MRP.QTY	:= CASE WHEN Prev_Run_Tab(V_Index).Available_Qty >= WO_BAL_TAB(V_LOWER_INDEX).Available_Qty 
+											THEN WO_BAL_TAB(V_LOWER_INDEX).Available_Qty
+											ELSE Prev_Run_Tab(V_Index).Available_Qty
+											End;
+						R_MRP.QTY	:= LEAST(R_MRP.QTY,HD.DEMAND_QTY);
+
+          V_QTY := R_MRP.QTY;
+          HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;
+          V_SEQ_NO       := V_SEQ_NO+1;
+          R_MRP.SEQ_NO   := V_SEQ_NO;
+          R_MRP.ORDER_NO := HD.ORDER_NO;
+          R_MRP.LINE_NO  := HD.LINE_NO;
+          R_MRP.ITEM_NO  := HD.ITEM_NO;
+          R_Mrp.Due_Date := Hd.Due_Date;
+          R_Mrp.Lot_No   := NULL;
+          
+          R_MRP.PO_NO    := NULL;
+          R_MRP.PEGGING_TYPE := NULL;
+          R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+          R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+          R_MRP.WORK_ORDER_NO    := V_LOWER_INDEX;                
+          R_MRP.WO_RELEASE_DATE := WO_BAL_TAB(V_Lower_Index).WO_RELEASE_DATE ;                    
+          R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+          R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+          R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+          R_Mrp.Pegging_Within_Lead_Time := Hd.With_In_Window_Days;
+          R_Mrp.Allocate_From    := 'WO';
+
+--          R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--          R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+          R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+          R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+          R_MRP.PEGGING_TYPE      :=  CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+                                                HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+                                          ELSE 'S'
+                                          END;
+          R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+          
+          WO_BAL_TAB(V_Lower_Index).Available_Qty :=  WO_BAL_TAB(V_Lower_Index).Available_Qty - R_Mrp.Qty;
+          WO_BAL_TAB(V_Lower_Index).AlloCAted_Qty :=  WO_BAL_TAB(V_Lower_Index).AlloCAted_Qty + R_Mrp.Qty;          
+          Prev_Run_Tab(V_Index).Available_Qty :=  Prev_Run_Tab(V_Index).Available_Qty - R_Mrp.Qty;
+          Prev_Run_Tab(V_Index).Allocated_Qty :=  Prev_Run_Tab(V_Index).Allocated_Qty + R_Mrp.Qty;          
+          R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+          R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+          R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+          R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+          R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);          
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty := R_Mrp.Qty;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+
+
+				  --LP_INSERT_ALLOCATION(R_MRP);
+                  H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+            
+				    ELSIF WO_BAL_TAB(V_LOWER_INDEX).Available_Qty >0 
+							AND R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+							And WO_BAL_TAB(V_LOWER_INDEX).ITEM_REVISION_NO = Hd.Item_Revision_No 
+							And WO_BAL_TAB(V_LOWER_INDEX).ITEM_NO = Hd.Item_No 
+    			    THEN
+                        R_MRP := NULL; 
+						R_MRP.QTY	:= CASE WHEN Prev_Run_Tab(V_Index).Available_Qty >= WO_BAL_TAB(V_LOWER_INDEX).Available_Qty 
+											THEN WO_BAL_TAB(V_LOWER_INDEX).Available_Qty
+											ELSE Prev_Run_Tab(V_Index).Available_Qty
+											End;
+						R_MRP.QTY	:= LEAST(R_MRP.QTY,HD.DEMAND_QTY);
+
+          V_QTY := R_MRP.QTY;
+          HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;
+          V_SEQ_NO       := V_SEQ_NO+1;
+          R_MRP.SEQ_NO   := V_SEQ_NO;
+          R_MRP.ORDER_NO := HD.ORDER_NO;
+          R_MRP.LINE_NO  := HD.LINE_NO;
+          R_MRP.ITEM_NO  := HD.ITEM_NO;
+          R_Mrp.Due_Date := Hd.Due_Date;
+          R_Mrp.Lot_No   := NULL;
+          
+          R_MRP.PO_NO    := NULL;
+          R_MRP.PEGGING_TYPE := NULL;
+          R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+          R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+          R_MRP.WORK_ORDER_NO    := V_LOWER_INDEX;                
+          R_MRP.WO_RELEASE_DATE := WO_BAL_TAB(V_Lower_Index).WO_RELEASE_DATE ;          
+          R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+          R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+          R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+          R_Mrp.Pegging_Within_Lead_Time := Hd.With_In_Window_Days;
+          R_Mrp.Allocate_From    := 'WO';
+
+--          R_Mrp.HIERARCHY_LEVEL := ITEM_TAB(IM).Low_Level_Code;
+--          R_Mrp.LEVEL_CODE      :=  ITEM_TAB(IM).Low_Level_Code;
+          R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+          R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+          R_MRP.PEGGING_TYPE      :=  CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+                                                HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+                                          ELSE 'S'
+                                          END;
+          R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+          R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+          R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+          R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+          R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+          R_MRP.FINAL_WORK_order_No    :=  NVL(HD.FINAL_WORK_order_No,R_MRP.WORK_ORDER_NO);          
+          
+          
+          WO_BAL_TAB(V_Lower_Index).Available_Qty :=  WO_BAL_TAB(V_Lower_Index).Available_Qty - R_Mrp.Qty;
+          WO_BAL_TAB(V_Lower_Index).AlloCAted_Qty :=  WO_BAL_TAB(V_Lower_Index).AlloCAted_Qty + R_Mrp.Qty;          
+          Prev_Run_Tab(V_Index).Available_Qty :=  Prev_Run_Tab(V_Index).Available_Qty - R_Mrp.Qty;
+          Prev_Run_Tab(V_Index).Allocated_Qty :=  Prev_Run_Tab(V_Index).Allocated_Qty + R_Mrp.Qty;          
+                R_MRP.WAREHOUSE    :=  HD.WAREHOUSE;          
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY := R_MRP.QTY;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+          
+				  
+          --LP_INSERT_ALLOCATION(R_MRP);
+          H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+
+					End If;
+				  EXIT ;
+				End Loop;--1..100,WO_BAL_TAB.EXISTS(V_LOWER_INDEX)
+			End If;--IF WO_BAL_TAB.EXISTS(V_LOWER_INDEX)
+     END IF; --If Prev_Run_Tab(V_Index).Available_Qty >0
+	V_INDEX := 'WO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(i+1);
+	EXIT WHEN NOT Prev_Run_Tab.EXISTS(V_INDEX) or HD.DEMAND_QTY <= 0;	 
+	END LOOP; --1..100 ,PREV_RUN_TAB
+END IF;-- IF PREV_RUN_TAB.EXISTS(V_INDEX) 
+--WO ALLOCATION FROM PREV RUN,END
+--DISPLAY('--current working END' ) ;
+--
+-- ALLOCATING PO QTY IN PREV RUN, START
+--
+  V_INDEX := 'PO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||1;
+  IF PREV_RUN_TAB.EXISTS(V_INDEX) 
+  THEN
+    FOR I IN 1..500
+    LOOP
+      IF NVL(PREV_RUN_TAB(V_INDEX).PARENT_ORDER_NO ,HD.ORDER_NO) = NVL(HD.PARENT_ORDER_NO ,HD.ORDER_NO)
+      AND NVL(PREV_RUN_TAB(V_INDEX).PARENT_ORDER_LINE_NO,HD.LINE_NO) = NVL(HD.PARENT_ORDER_LINE_NO,HD.LINE_NO)
+      THEN
+        V_LOWER_INDEX := PREV_RUN_TAB(V_INDEX).PO_NO||'~'||PREV_RUN_TAB(V_INDEX).PO_LINE_NO;
+          IF PO_BAL_TAB.EXISTS(V_LOWER_INDEX)
+          THEN 
+            IF PO_BAL_TAB(V_LOWER_INDEX).AVAILABLE_QTY >0
+            THEN
+                R_MRP := NULL;                  
+                R_MRP.QTY	:= 
+                CASE WHEN Prev_Run_Tab(V_Index).Available_Qty >= PO_BAL_TAB(V_LOWER_INDEX).AVAILABLE_QTY
+											THEN PO_BAL_TAB(V_LOWER_INDEX).AVAILABLE_QTY
+											ELSE Prev_Run_Tab(V_Index).Available_Qty
+											End;
+                R_MRP.QTY	:= LEAST(R_MRP.QTY,HD.DEMAND_QTY);
+                V_QTY := R_MRP.QTY;
+                HD.DEMAND_QTY := HD.DEMAND_QTY-R_MRP.QTY;
+                V_SEQ_NO       := V_SEQ_NO+1;
+                R_MRP.SEQ_NO   := V_SEQ_NO;
+                R_MRP.ORDER_NO := HD.ORDER_NO;
+                R_MRP.LINE_NO  := HD.LINE_NO;
+                R_MRP.ITEM_NO  := HD.ITEM_NO;
+                R_Mrp.Due_Date := Hd.Due_Date;
+                R_Mrp.Lot_No   := NULL;
+                R_MRP.DEBUGG_REF := $$PLSQL_LINE;                                           
+                R_MRP.PO_NO    := PREV_RUN_TAB(V_INDEX).PO_NO;
+                R_MRP.PO_LINE_NO    := PREV_RUN_TAB(V_INDEX).PO_LINE_NO;
+
+                R_MRP.PEGGING_TYPE      :=  CASE WHEN HD.WITH_IN_WINDOW_DAYS = 'Y' OR 
+                                                      HD.ORDER_SOFT_OR_HARD ='H' THEN 'H'
+                                                ELSE 'S'
+                                                END;
+                R_MRP.SO_WO_LINK   := HD.SO_WO_LINK;
+                R_MRP.PARENT_SEQ_NO    := NVL(HD.PARENT_SEQ_NO,R_MRP.SEQ_NO);
+                R_MRP.WORK_ORDER_NO    := NULL; 
+                R_MRP.WO_RELEASE_DATE := NULL;
+                R_MRP.ITEM_REVISION_NO := HD.ITEM_REVISION_NO;                
+                R_MRP.ALLOCATION_TYPE  := HD.ALLOCATION_TYPE;
+                R_MRP.ORDER_SOFT_OR_HARD := HD.ORDER_SOFT_OR_HARD;
+                R_MRP.PEGGING_WITHIN_LEAD_TIME := HD.WITH_IN_WINDOW_DAYS;
+                R_Mrp.VENDOR_NO    := PO_BAL_TAB(V_LOWER_INDEX).VENDOR_NO;
+                R_Mrp.Allocate_From    := 'PO';
+                R_Mrp.HIERARCHY_LEVEL := HD.HIERARCHY_LEVEL;
+                R_Mrp.LEVEL_CODE      :=  HD.LEVEL_CODE;
+                R_MRP.PARENT_PEGGING_TYPE    :=  NVL(HD.PARENT_PEGGING_TYPE,R_MRP.PEGGING_TYPE);
+                R_Mrp.Parent_Order_No    :=  Nvl(Hd.Parent_Order_No,R_Mrp.Order_No);
+                R_Mrp.Parent_Order_Line_No    :=  Nvl(Hd.Parent_Order_Line_No,R_Mrp.Line_No);                
+                R_Mrp.Parent_ITEM_No    :=  Hd.Parent_ITEM_No;
+                R_MRP.parent_WORK_order_No    :=  HD.parent_WORK_order_No;                
+                R_MRP.FINAL_WORK_ORDER_NO    :=  NVL(HD.FINAL_WORK_ORDER_NO,R_MRP.WORK_ORDER_NO);          
+                PO_BAL_TAB(V_LOWER_INDEX).AVAILABLE_QTY := PO_BAL_TAB(V_LOWER_INDEX).AVAILABLE_QTY - R_MRP.QTY;
+                PO_BAL_TAB(V_LOWER_INDEX).AlloCAted_Qty := PO_BAL_TAB(V_LOWER_INDEX).AlloCAted_Qty + R_Mrp.Qty;
+                Prev_Run_Tab(V_Index).Available_Qty :=  Prev_Run_Tab(V_Index).Available_Qty - R_Mrp.Qty;
+                PREV_RUN_TAB(V_INDEX).ALLOCATED_QTY :=  PREV_RUN_TAB(V_INDEX).ALLOCATED_QTY + R_MRP.QTY;          
+
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,START
+--
+IF WO_LINE_QTY_TAB.EXISTS(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO) THEN
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY 
+        := Wo_Line_Qty_Tab(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).Qty+R_Mrp.Qty;
+ELSE
+  WO_LINE_QTY_TAB(R_Mrp.Order_No||'~'||R_Mrp.Line_No||'~'||R_Mrp.PARENT_ORDER_NO||'~'||R_Mrp.PARENT_ORDER_LINE_NO).QTY := R_MRP.QTY;
+END IF;
+-- 
+-- ADDING ALLOTED QTY TO NEW TABLE ADN IT WILL USE IN _DEMADN,END
+--
+               --LSR--LP_INSERT_ALLOCATION(R_MRP);
+                H_ALLOCATION_TAB(V_SEQ_NO) := R_MRP;
+            END IF;--PO_BAL_TAB(V_LOWER_INDEX).AVAILABLE_QTY >0
+          END IF;--PO_BAL_TAB.EXISTS(V_LOWER_INDEX)
+      END IF;--NVL(PREV_RUN_TAB(V_INDEX).PARENT_ORDER_NO ,HD.ORDER_NO)
+      V_INDEX :=  'PO'||'~'||HD.ORDER_NO||'~'||HD.LINE_NO||'~'||(I+1);
+      EXIT WHEN NOT PREV_RUN_TAB.EXISTS(V_INDEX) OR HD.DEMAND_QTY <= 0;	          
+    END LOOP;
+  END IF;--PREV_RUN_TAB.EXISTS(V_INDEX) 
+--
+-- ALLOCATING PO QTY IN PREV RUN, END
+--
+          END IF;
+--COPY END
+    IF HD.ALLOCATION_TYPE = 'WO_CO'
+    THEN
+      IF TAB_BOM_BAL_QTY.EXISTS(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO)
+      THEN 
+        IF HD.DEMAND_QTY> 0
+        THEN
+          TAB_BOM_BAL_QTY(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).QTY := 
+          TAB_BOM_BAL_QTY(HD.ORDER_NO||'~'||HD.LINE_NO||'~'||HD.ITEM_NO).QTY+HD.DEMAND_QTY;  
+        END IF;
+      END IF;
+    END IF;
+      End Loop; -- H-DEMAND LOOP
+FORALL A IN H_ALLOCATION_TAB.FIRST..H_ALLOCATION_TAB.LAST
+INSERT INTO MRP_ALLOCATION_TEMP VALUES H_ALLOCATION_TAB(A);
+H_ALLOCATION_TAB.DELETE;
+COMMIT;-- ADDED INLASER
+
+--DISPLAY('----------------------');    
+
+
+END LOOP; 
+END IF;
+-- ITEMS LOOP FOR HARD DEMAND, END
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('HARD PEGGING ITEMS' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+-- moved this from top to here,start
+IF ALLOCATION_TAB.COUNT> 0 THEN
+  FORALL A IN ALLOCATION_TAB.FIRST..ALLOCATION_TAB.LAST
+  INSERT INTO MRP_ALLOCATION_TEMP VALUES ALLOCATION_TAB(A);
+END IF;
+ALLOCATION_TAB.DELETE;
+COMMIT;
+-- moved this from top to here,end
+
+-- MOVED THIS BLOCK FROM TOP,START
+--3.
+-- POPILATING WO INFO INTO COLLECTION  START
+  OPEN C_ITEM_WO_BAL;
+  FETCH C_ITEM_WO_BAL BULK COLLECT INTO ITEM_WO_BAL_TAB_T;
+  CLOSE C_ITEM_WO_BAL;
+  
+-- 4 
+-- START
+OPEN C1;
+FETCH C1 BULK COLLECT INTO TAB_PC_WO_BAL;
+CLOSE C1;
+IF TAB_PC_WO_BAL.COUNT> 0 
+THEN 
+  FOR I IN TAB_PC_WO_BAL.FIRST..TAB_PC_WO_BAL.LAST
+  LOOP
+   TAB1_PC_WO_BAL(TAB_PC_WO_BAL(I).PCINDX) := TAB_PC_WO_BAL(I);
+  END LOOP;
+  TAB_PC_WO_BAL.DELETE;
+END IF;
+
+-- POMOVED FRM TOP TO HERE START
+--4.
+-- POPILATING PO INFO INTO COLLECTION  START
+  OPEN C_ITEM_PO_BAL;
+  FETCH C_ITEM_PO_BAL BULK COLLECT INTO ITEM_PO_BAL_TAB_T;
+  CLOSE C_ITEM_PO_BAL;
+  IF ITEM_PO_BAL_TAB_T.COUNT>0
+  THEN
+FOR I IN   ITEM_PO_BAL_TAB_T.FIRST..ITEM_PO_BAL_TAB_T.LAST
+LOOP
+  ITEM_PO_BAL_TAB(ITEM_PO_BAL_TAB_T(I).ITEM_PO_INDEX) :=  ITEM_PO_BAL_TAB_T(I);
+END LOOP;
+ITEM_PO_BAL_TAB_T.DELETE;
+END IF;
+-- POPILATING PO INFO INTO COLLECTION  END
+-- POMOVED FRM TOP TO HERE END
+--END
+
+--END
+IF ITEM_WO_BAL_TAB_T.COUNT>0
+THEN
+  FOR I IN   ITEM_WO_BAL_TAB_T.FIRST..ITEM_WO_BAL_TAB_T.LAST
+  LOOP
+    ITEM_WO_BAL_TAB(ITEM_WO_BAL_TAB_T(I).ITEM_WO_INDEX) :=  ITEM_WO_BAL_TAB_T(I);
+  END LOOP;
+  ITEM_WO_BAL_TAB_T.DELETE;
+END IF;
+
+
+
+-- POPILATING WO INFO INTO COLLECTION  END
+-- MOVED THIS BLOCK FROM TOP,END
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging C_DEMAND' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+-- ITEMS LOOP FOR DEMAND, START
+--2577
+--IF 1=2 THEN
+--DISPLAY('--------------Normal Demand start-------------------');
+FOR I IN (
+SELECT A.ORDER_NO||'~'||A.LINE_NO Indx,A.ORDER_NO,A.LINE_NO,SUM(QTY) QTY,SUM(QTY) V_QTY
+FROM MRP_ALLOCATION_TEMP  A,MFG_WO_BOM B
+WHERE A.ALLOCATION_TYPE = 'WO_CO'
+AND A.ORDER_NO = B.WORK_ORDER_NO
+AND A.ITEM_NO = B.ITEM_NO
+AND B.BOM_TYPE = 'MJ'
+AND PEGGING_TYPE = 'H'
+GROUP BY A.ORDER_NO,A.LINE_NO
+)
+LOOP
+  MJ_ALLOCATED_QTY_TAB(I.Indx) := I;
+END LOOP;
+
+IF ITEM_TAB.COUNT> 0 
+THEN
+FOR IM IN  ITEM_TAB.FIRST..ITEM_TAB.LAST
+LOOP
+      FOR D IN C_DEMAND(ITEM_TAB(IM).ITEM_NO) 
+      LOOP
+If D.Allocation_Type = 'WO_CO' 
+    AND WO_LINE_QTY_TAB.EXISTS(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO) THEN
+  If Wo_Line_Qty_Tab(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).Qty > 0 
+      THEN
+  WO_LINE_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).V_QTY := LEAST(D.BALANCE_QTY_BASE_UOM,WO_LINE_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).QTY);
+  D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM - WO_LINE_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).V_QTY;
+  WO_LINE_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).QTY := WO_LINE_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).QTY-
+                                                        WO_LINE_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.PARENT_ORDER_NO||'~'||D.PARENT_ORDER_LINE_NO).V_QTY;      
+    END IF;                                                    
+END IF;
+
+IF D.ALLOCATION_TYPE = 'WO_CO'
+THEN
+  IF TAB_BOM_BAL_QTY.EXISTS(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO)
+  THEN 
+    D.BALANCE_QTY_BASE_UOM := LEAST(D.BALANCE_QTY_BASE_UOM,TAB_BOM_BAL_QTY(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).QTY);
+    TAB_BOM_BAL_QTY(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).QTY := 
+    TAB_BOM_BAL_QTY(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).QTY-D.BALANCE_QTY_BASE_UOM;
+  END IF;
+END IF;
+
+IF NVL(D.BOM_TYPE,'MMD') = 'MJ'
+THEN
+  IF MJ_ALLOCATED_QTY_TAB.EXISTS(D.ORDER_NO||'~'||D.LINE_NO)
+  THEN 
+  MJ_ALLOCATED_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO).V_QTY := LEAST(D.BALANCE_QTY_BASE_UOM,MJ_ALLOCATED_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO).QTY);
+  D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM - MJ_ALLOCATED_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO).V_QTY;
+  MJ_ALLOCATED_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO).QTY := MJ_ALLOCATED_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO).QTY+
+                                                                                D.BALANCE_QTY_BASE_UOM;      
+  ELSE
+  MJ_ALLOCATED_QTY_TAB(D.ORDER_NO||'~'||D.LINE_NO).QTY := D.BALANCE_QTY_BASE_UOM;
+  END IF;
+END IF;
+
+          V_NUMBER := SF_ALLOCATE(D.ITEM_NO,NULL,D.BALANCE_QTY_BASE_UOM);
+
+                  if D.level_code is not null then
+                     v_level_code := to_number(D.level_code)+1;
+                     v_hierarchy_level := substr(D.hierarchy_level,1,v_level_code*2+((v_level_code-1)*4))||lpad(to_char(D.line_no), 4,'0')||substr(D.hierarchy_level,v_level_code*2+((v_level_code-1)*4)+4);
+                  else
+                    v_level_code := '0';
+                    v_hierarchy_level := '000000000000000000000000000000';
+                  end if;
+
+          
+--
+--INSERTING ISSUED RECORD IN NORMAL DEMAND,START
+--
+  IF WO_ISSUED_TAB.EXISTS(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO) 
+  THEN
+    V_SEQ_NO  := V_SEQ_NO+1;  
+    ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+    ALLOCATION_TAB(V_SEQ_NO).QTY := 
+        least(WO_ISSUED_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).BALANCE_IN_ISSUED_QTY , D.BALANCE_QTY_BASE_UOM);
+    D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+    
+    IF ALLOCATION_TAB(V_SEQ_NO).QTY = WO_ISSUED_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).BALANCE_IN_ISSUED_QTY
+    THEN 
+      WO_ISSUED_TAB.DELETE(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO);
+    ELSE
+    WO_ISSUED_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).BALANCE_IN_ISSUED_QTY := 
+      WO_ISSUED_TAB(D.ORDER_NO||'~'||D.LINE_NO||'~'||D.ITEM_NO).BALANCE_IN_ISSUED_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+    END IF;
+      
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'ISSUED';
+      ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := 'ISSUED';
+      ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+      
+      ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+      ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+      ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+      ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+      ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+      ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+      --D.PARENT_ORDER_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+      ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+--IF D.PARENT_ITEM_NO = ITEM_TAB(IM).ITEM_NO THEN
+--  VENDOR NO CALCULATION  
+--ELSE
+--  VENDOR NO CALCULATION
+--END IF;
+
+      ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+      ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+      ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+      ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+
+  END IF;
+--
+--INSERTING ISSUED RECORD IN NORMAL DEMAND,END
+--
+--FORALL A IN ALLOCATION_TAB.FIRST..ALLOCATION_TAB.LAST
+--INSERT INTO MRP_ALLOCATION_TEMP VALUES ALLOCATION_TAB(A);
+--ALLOCATION_TAB.DELETE;
+--COMMIT;
+--RETURN;
+--
+-- CILD WO INTACT FLAG FOR WO_CO, START
+--
+IF D.ALLOCATION_TYPE = 'WO_CO' AND R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'Y'
+AND 1=2
+THEN
+    V_INDEX := D.ITEM_NO||'~'||1;
+  IF ITEM_WO_BAL_TAB.EXISTS(V_INDEX) 
+        AND D.BALANCE_QTY_BASE_UOM >0 
+  THEN  
+    FOR WO IN 1..500
+    LOOP
+      IF ITEM_WO_BAL_TAB.EXISTS(V_INDEX) THEN
+        IF ITEM_WO_BAL_TAB(V_INDEX).PARENT_WORK_ORDER_NO = D.ORDER_NO THEN
+           IF R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+            AND ITEM_WO_BAL_TAB(V_INDEX).ITEM_REVISION_NO = D.Item_Revision_No 
+            AND ITEM_WO_BAL_TAB(V_INDEX).Available_Qty >0
+            AND ITEM_WO_BAL_TAB(V_INDEX).WAREHOUSE = D.WAREHOUSE 
+          THEN 
+            V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+                                  THEN ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+   
+      ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'WO';
+ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := ITEM_WO_BAL_TAB(V_INDEX).WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).WO_RELEASE_DATE := ITEM_WO_BAL_TAB(V_INDEX).WO_RELEASE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+    ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+            
+          ELSIF R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+             AND ITEM_WO_BAL_TAB(V_INDEX).Available_Qty >0
+             AND ITEM_WO_BAL_TAB(V_INDEX).WAREHOUSE = D.WAREHOUSE
+             AND 1=2
+          THEN  
+            V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > ITEM_WO_BAL_TAB(V_INDEX).Available_Qty 
+                                  THEN ITEM_WO_BAL_TAB(V_INDEX).Available_Qty
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'WO';
+ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := ITEM_WO_BAL_TAB(V_INDEX).WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).WO_RELEASE_DATE := ITEM_WO_BAL_TAB(V_INDEX).WO_RELEASE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+         END IF;
+        END IF;-- PARENT WO CHECKING  
+      ELSE 
+       --EXIT; 
+       NULL;
+      END IF;
+      EXIT WHEN D.BALANCE_QTY_BASE_UOM<=0;
+      V_INDEX := D.ITEM_NO||'~'||(WO+1);
+    END LOOP;
+  END IF;
+END IF;
+--
+-- CILD WO INTACT FLAG FOR WO_CO, END
+--
+
+--
+-- CILD WO INTACT FLAG FOR WO_CO, START-1
+--
+IF D.ALLOCATION_TYPE = 'WO_CO' AND R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'Y'
+--and 1=2
+THEN
+  IF TAB1_PC_WO_BAL.EXISTS(D.ORDER_NO||'~'||1)
+  THEN
+  FOR  I IN 1..25 LOOP 
+  V_INDEX := D.ORDER_NO||'~'||I;
+    IF TAB1_PC_WO_BAL.EXISTS(V_INDEX)
+    THEN
+    IF TAB1_PC_WO_BAL(V_INDEX).CITEM_NO = D.ITEM_NO
+    AND TAB1_PC_WO_BAL(V_INDEX).AVAILABLE_QTY> 0
+    AND TAB1_PC_WO_BAL(V_INDEX).WAREHOUSE = D.WAREHOUSE
+    THEN
+      V_SEQ_NO  := V_SEQ_NO+1; 
+ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > TAB1_PC_WO_BAL(V_INDEX).Available_Qty 
+                      THEN TAB1_PC_WO_BAL(V_INDEX).Available_Qty 
+                      ELSE D.BALANCE_QTY_BASE_UOM
+                      END;
+D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;                      
+TAB1_PC_WO_BAL(V_INDEX).Available_Qty := TAB1_PC_WO_BAL(V_INDEX).Available_Qty -ALLOCATION_TAB(V_SEQ_NO).QTY; 
+
+
+ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'WO';
+ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := TAB1_PC_WO_BAL(V_INDEX).CWO;
+ALLOCATION_TAB(V_SEQ_NO).WO_RELEASE_DATE := TAB1_PC_WO_BAL(V_INDEX).WO_RELEASE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+-- EXIT WHEN D.BALANCE_QTY_BASE_UOM<=0;   
+    END IF;
+ELSE
+EXIT;
+END IF;
+ END LOOP;    
+  END IF;
+END IF;
+
+
+--
+-- CILD WO INTACT FLAG FOR WO_CO, END-1
+--
+
+
+
+
+-- STOCK ALLOCATION, START
+IF D.PEGGING_WITHIN_LEAD_TIME <> 'Y'
+  OR R_APP_SETTINGS.STOCK_WINDOW_DAYS_FLG = 'Y'
+THEN
+V_STOCK_INDEX := D.Item_No||'~'||1;
+If Stock_Tab.Exists(V_STOCK_INDEX) 
+    AND D.BALANCE_QTY_BASE_UOM > 0 
+  Then
+  For I In 1..1000
+  Loop
+    If Stock_Tab.Exists(V_STOCK_INDEX) Then
+      If R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+        And Stock_Tab(V_STOCK_INDEX).Rev_No = D.Item_Revision_No 
+        And Stock_Tab(V_STOCK_INDEX).Available_Qty >0 
+        AND Stock_Tab(V_STOCK_INDEX).WAREHOUSE =D.WAREHOUSE
+      Then
+
+      V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > Stock_Tab(V_STOCK_INDEX).Available_Qty 
+                                  THEN Stock_Tab(V_STOCK_INDEX).Available_Qty
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      
+      Stock_Tab(V_STOCK_INDEX).Available_Qty 
+            := Stock_Tab(V_STOCK_INDEX).Available_Qty-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      Stock_Tab(V_STOCK_INDEX).ALLOTED_QTY 
+            := Stock_Tab(V_STOCK_INDEX).Alloted_Qty+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'STOCK';
+      ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := 'STOCK';
+      ALLOCATION_TAB(V_SEQ_NO).LOT_NO := Stock_Tab(V_STOCK_INDEX).LOT_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PO_NO := 'STOCK';
+      ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+      
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+
+      Elsif R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+        And Stock_Tab(V_STOCK_INDEX).Available_Qty >0
+        AND Stock_Tab(V_STOCK_INDEX).WAREHOUSE =D.WAREHOUSE        
+      Then
+      
+      V_SEQ_NO  := V_SEQ_NO+1;      
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > Stock_Tab(V_STOCK_INDEX).Available_Qty 
+                                  THEN Stock_Tab(V_STOCK_INDEX).Available_Qty
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      
+      Stock_Tab(V_STOCK_INDEX).Available_Qty 
+            := Stock_Tab(V_STOCK_INDEX).Available_Qty-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      Stock_Tab(V_STOCK_INDEX).ALLOTED_QTY 
+            := Stock_Tab(V_STOCK_INDEX).Alloted_Qty+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'STOCK';
+      ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := 'STOCK';
+      ALLOCATION_TAB(V_SEQ_NO).LOT_NO := Stock_Tab(V_STOCK_INDEX).LOT_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+--ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := CASE WHEN D.ALLOCATION_TYPE = 'SO_WO' THEN 'STOCK'
+                                                      ELSE D.FINAL_WORK_ORDER_NO END ;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+
+    ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+      END IF;
+    ELSE
+      EXIT; -- EXIT FROM 1000 LOOP
+    END IF;
+    EXIT WHEN D.BALANCE_QTY_BASE_UOM<=0;
+    V_STOCK_INDEX := D.Item_No||'~'||(I+1);
+  END LOOP;
+END IF;
+END IF;-- APP SETTINGS CONDITION 
+-- STOCK ALLOCATION, END
+
+--
+-- WO ALLOCATION, START
+IF R_APP_SETTINGS.WO_WINDOW_DAYS_FLG <> 'N'
+   OR
+   R_APP_SETTINGS.WO_OUTSIDE_WINDOW_DAYS_FLG <> 'N'
+THEN 
+
+  V_Index := D.Item_No||'~'||1;
+  IF ITEM_WO_BAL_TAB.EXISTS(V_INDEX) 
+        AND D.BALANCE_QTY_BASE_UOM >0 
+  Then  
+    FOR WO IN 1..500
+    Loop
+      If Item_Wo_Bal_Tab.Exists(V_Index) Then
+           IF R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+            AND ITEM_WO_BAL_TAB(V_INDEX).ITEM_REVISION_NO = D.Item_Revision_No 
+            AND ITEM_WO_BAL_TAB(V_INDEX).Available_Qty >0
+            AND ITEM_WO_BAL_TAB(V_INDEX).WAREHOUSE = D.WAREHOUSE
+            AND (
+                  (R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'Y' AND  NVL(ITEM_WO_BAL_TAB(V_INDEX).PARENT_WORK_ORDER_NO,D.ORDER_NO) = D.ORDER_NO)
+                    OR R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'N'
+                 )
+            AND ( 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'Y' AND 
+                  (
+                  R_APP_SETTINGS.WO_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.WO_WINDOW_DAYS_FLG = 'R' AND ITEM_WO_BAL_TAB(V_INDEX).REQ_DATE <= D.DUE_DATE)
+                  )
+                  )
+                  OR 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'N' AND 
+                  (
+                  R_APP_SETTINGS.WO_OUTSIDE_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.WO_OUTSIDE_WINDOW_DAYS_FLG = 'R' AND ITEM_WO_BAL_TAB(V_INDEX).REQ_DATE <= D.DUE_DATE)
+                  )
+                  )
+                )
+          Then 
+            V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+                                  THEN ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'WO';
+      ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := ITEM_WO_BAL_TAB(V_INDEX).WORK_ORDER_NO;
+      ALLOCATION_TAB(V_SEQ_NO).WO_RELEASE_DATE := ITEM_WO_BAL_TAB(V_INDEX).WO_RELEASE_DATE;            
+      ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := CASE WHEN D.ALLOCATION_TYPE = 'SO_WO' THEN ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO
+                                                        ELSE D.FINAL_WORK_ORDER_NO END;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+
+            
+          ELSIF R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+             AND ITEM_WO_BAL_TAB(V_INDEX).Available_Qty >0
+            AND ITEM_WO_BAL_TAB(V_INDEX).WAREHOUSE = D.WAREHOUSE             
+            AND (
+                  (R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'Y' AND  NVL(ITEM_WO_BAL_TAB(V_INDEX).PARENT_WORK_ORDER_NO,D.ORDER_NO) = D.ORDER_NO)
+                    OR R_APP_SETTINGS.WO_CHILD_INTACT_FLG = 'N'
+                 )
+            AND ( 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'Y' AND 
+                  (
+                  R_APP_SETTINGS.WO_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.WO_WINDOW_DAYS_FLG = 'R' AND ITEM_WO_BAL_TAB(V_INDEX).REQ_DATE <= D.DUE_DATE)
+                  )
+                  )
+                  OR 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'N' AND 
+                  (
+                  R_APP_SETTINGS.WO_OUTSIDE_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.WO_OUTSIDE_WINDOW_DAYS_FLG = 'R' AND ITEM_WO_BAL_TAB(V_INDEX).REQ_DATE <= D.DUE_DATE)
+                  )
+                  )
+                )
+          THEN 
+            V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > ITEM_WO_BAL_TAB(V_INDEX).Available_Qty 
+                                  THEN ITEM_WO_BAL_TAB(V_INDEX).Available_Qty
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).AVAILABLE_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY 
+            := ITEM_WO_BAL_TAB(V_INDEX).ALLOCATED_QTY+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+        ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+        ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'WO';
+        ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := ITEM_WO_BAL_TAB(V_INDEX).WORK_ORDER_NO;
+        ALLOCATION_TAB(V_SEQ_NO).WO_RELEASE_DATE := ITEM_WO_BAL_TAB(V_INDEX).WO_RELEASE_DATE;        
+        ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+        ALLOCATION_TAB(V_SEQ_NO).PO_NO := NULL;
+        ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO :=replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+--ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := CASE WHEN D.ALLOCATION_TYPE ='SO_WO' THEN ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO
+                                                      ELSE D.FINAL_WORK_ORDER_NO END ;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+         END IF;
+      ELSE 
+       EXIT; 
+      END IF;
+      EXIT WHEN D.BALANCE_QTY_BASE_UOM<=0;
+      V_INDEX := D.ITEM_NO||'~'||(WO+1);
+    END LOOP;
+  END IF;
+END IF; -- WO APP SETTINGS CHECKING
+-- WO ALLOCATION, END
+--
+
+--
+-- PO ALLOCATION, START
+IF R_APP_SETTINGS.PO_WINDOW_DAYS_FLG <> 'N'
+      OR
+   R_APP_SETTINGS.PO_OUTSIDE_WINDOW_DAYS_FLG <> 'N'
+THEN 
+  V_INDEX := D.ITEM_NO||'~'||1;
+  IF ITEM_PO_BAL_TAB.EXISTS(V_INDEX) 
+      AND D.BALANCE_QTY_BASE_UOM >0 
+  THEN  
+    FOR PO IN 1..500
+    LOOP
+      IF ITEM_PO_BAL_TAB.EXISTS(V_INDEX) THEN
+           IF R_App_Settings.Rev_No_Required_Mat_Planning = 'Y'
+            AND ITEM_PO_BAL_TAB(V_INDEX).ITEM_REVISION_NO = D.Item_Revision_No 
+            AND ITEM_PO_BAL_TAB(V_INDEX).Available_Qty >0
+            AND ITEM_PO_BAL_TAB(V_INDEX).WAREHOUSE = D.WAREHOUSE
+            AND ( 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'Y' AND 
+                  (
+                  R_APP_SETTINGS.PO_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.PO_WINDOW_DAYS_FLG = 'R' AND ITEM_PO_BAL_TAB(V_INDEX).DUE_DATE <= D.DUE_DATE)
+                  )
+                  )
+                  OR 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'N' AND 
+                  (
+                  R_APP_SETTINGS.PO_OUTSIDE_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.PO_OUTSIDE_WINDOW_DAYS_FLG = 'R' AND ITEM_PO_BAL_TAB(V_INDEX).DUE_DATE <= D.DUE_DATE)
+                  )
+                  )
+                )
+          THEN 
+            V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > ITEM_PO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+                                  THEN ITEM_PO_BAL_TAB(V_INDEX).AVAILABLE_QTY
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      
+      ITEM_PO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+            := ITEM_PO_BAL_TAB(V_INDEX).AVAILABLE_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_PO_BAL_TAB(V_INDEX).ALLOCATED_QTY 
+            := ITEM_PO_BAL_TAB(V_INDEX).ALLOCATED_QTY+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'PO';
+      ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_NO := ITEM_PO_BAL_TAB(V_INDEX).PO_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := ITEM_PO_BAL_TAB(V_INDEX).LINE_NO;
+--EXECUTE IMMEDIATE 'TRUNCATE TABLE ZZZ_PEG';
+--delete from ZZZ_PEG;
+--commit;
+--ZZZ_PEGG('D.ORDER_NO :'||D.ORDER_NO);
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+--ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := CASE WHEN D.ALLOCATION_TYPE ='SO_WO' THEN ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO
+                                                      ELSE D.FINAL_WORK_ORDER_NO END ;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+
+ALLOCATION_TAB(V_SEQ_NO).VENDOR_NO := ITEM_PO_BAL_TAB(V_INDEX).VENDOR_NO ;--D.VENDOR_NO;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+          ELSIF R_App_Settings.Rev_No_Required_Mat_Planning = 'N'
+             AND ITEM_PO_BAL_TAB(V_INDEX).Available_Qty >0
+             AND ITEM_PO_BAL_TAB(V_INDEX).WAREHOUSE = D.WAREHOUSE
+            AND ( 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'Y' AND 
+                  (
+                  R_APP_SETTINGS.PO_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.PO_WINDOW_DAYS_FLG = 'R' AND ITEM_PO_BAL_TAB(V_INDEX).DUE_DATE <= D.DUE_DATE)
+                  )
+                  )
+                  OR 
+                  (D.PEGGING_WITHIN_LEAD_TIME = 'N' AND 
+                  (
+                  R_APP_SETTINGS.PO_OUTSIDE_WINDOW_DAYS_FLG = 'A'
+                  OR
+                  (R_APP_SETTINGS.PO_OUTSIDE_WINDOW_DAYS_FLG = 'R' AND ITEM_PO_BAL_TAB(V_INDEX).DUE_DATE <= D.DUE_DATE)
+                  )
+                  )
+                )
+          THEN 
+            V_SEQ_NO  := V_SEQ_NO+1;            
+      ALLOCATION_TAB(V_SEQ_NO).QTY := CASE WHEN D.BALANCE_QTY_BASE_UOM > ITEM_PO_BAL_TAB(V_INDEX).Available_Qty 
+                                  THEN ITEM_PO_BAL_TAB(V_INDEX).Available_Qty
+                                  ELSE D.BALANCE_QTY_BASE_UOM
+                                  END;
+      D.BALANCE_QTY_BASE_UOM := D.BALANCE_QTY_BASE_UOM-ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ITEM_PO_BAL_TAB(V_INDEX).AVAILABLE_QTY 
+            := ITEM_PO_BAL_TAB(V_INDEX).AVAILABLE_QTY-ALLOCATION_TAB(V_SEQ_NO).QTY;
+      ITEM_PO_BAL_TAB(V_INDEX).ALLOCATED_QTY 
+            := ITEM_PO_BAL_TAB(V_INDEX).ALLOCATED_QTY+ALLOCATION_TAB(V_SEQ_NO).QTY;
+
+      ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+      ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'PO';
+      ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+      ALLOCATION_TAB(V_SEQ_NO).PO_NO := ITEM_PO_BAL_TAB(V_INDEX).PO_NO;
+      ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := ITEM_PO_BAL_TAB(V_INDEX).LINE_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+--ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := CASE WHEN D.ALLOCATION_TYPE ='SO_WO' THEN ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO
+                                                      ELSE D.FINAL_WORK_ORDER_NO END ;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+
+ALLOCATION_TAB(V_SEQ_NO).VENDOR_NO := ITEM_PO_BAL_TAB(V_INDEX).VENDOR_NO ;--D.VENDOR_NO;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+      
+         END IF;
+      ELSE 
+       EXIT; 
+      END IF;
+      EXIT WHEN D.BALANCE_QTY_BASE_UOM<=0;
+      V_INDEX := D.ITEM_NO||'~'||(PO+1);
+    END LOOP;
+  END IF;
+END IF;-- PO APP SETTNIGS CHECKING
+-- PO ALLOCATION, END
+--
+
+    --
+    -- NO-PLAN, START
+    IF D.BALANCE_QTY_BASE_UOM >0 
+    THEN 
+          V_SEQ_NO  := V_SEQ_NO+1; 
+          --ALLOCATION_TAB(V_SEQ_NO).QTY  :=  D.BALANCE_QTY_BASE_UOM;
+          ALLOCATION_TAB(V_SEQ_NO).QTY  := 
+          ROUND(D.BALANCE_QTY_BASE_UOM*(100/(100-(NVL(ITEM_TAB(IM).ADD_QC_SCRAP_PERCEN_PER_WO,0))))+ nvl(ITEM_TAB(IM).ADD_QC_SCRAP_QTY_PER_WO,0),4);
+          ALLOCATION_TAB(V_SEQ_NO).SEQ_NO := V_SEQ_NO;
+          ALLOCATION_TAB(V_SEQ_NO).ALLOCATE_FROM := 'NO-PLAN';
+          ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO := 'NO-PLAN';
+          ALLOCATION_TAB(V_SEQ_NO).LOT_NO := NULL;
+          ALLOCATION_TAB(V_SEQ_NO).PO_NO := 'NO-PLAN';
+          ALLOCATION_TAB(V_SEQ_NO).PO_LINE_NO := NULL;
+
+
+ALLOCATION_TAB(V_SEQ_NO).ORDER_NO := D.ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).LINE_NO := D.LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).DUE_DATE := D.DUE_DATE;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_NO := D.ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).ITEM_REVISION_NO := D.ITEM_REVISION_NO;
+ALLOCATION_TAB(V_SEQ_NO).ALLOCATION_TYPE := D.ALLOCATION_TYPE;
+ALLOCATION_TAB(V_SEQ_NO).SO_WO_LINK := NULL;
+ALLOCATION_TAB(V_SEQ_NO).ORDER_SOFT_OR_HARD := NULL;
+ALLOCATION_TAB(V_SEQ_NO).PEGGING_WITHIN_LEAD_TIME := D.PEGGING_WITHIN_LEAD_TIME;
+
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_SEQ_NO := D.PARENT_SEQ_NO;
+
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_NO := replace(D.PARENT_ORDER_NO,'NOT PEGGED:');
+--D.PARENT_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ORDER_LINE_NO := D.PARENT_ORDER_LINE_NO;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_WORK_ORDER_NO := D.PARENT_WORK_ORDER_NO;
+--ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := D.FINAL_WORK_ORDER_NO;
+ALLOCATION_TAB(V_SEQ_NO).FINAL_WORK_ORDER_NO := CASE WHEN D.ALLOCATION_TYPE ='SO_WO' THEN ALLOCATION_TAB(V_SEQ_NO).WORK_ORDER_NO
+                                                      ELSE D.FINAL_WORK_ORDER_NO END ;
+ALLOCATION_TAB(V_SEQ_NO).PARENT_ITEM_NO := D.PARENT_ITEM_NO;
+ALLOCATION_TAB(V_SEQ_NO).PRIORITY_CODE := D.PRIORITY_CODE;
+ALLOCATION_TAB(V_SEQ_NO).LEVEL_CODE := V_LEVEL_CODE;
+ALLOCATION_TAB(V_SEQ_NO).HIERARCHY_LEVEL := V_HIERARCHY_LEVEL;
+ALLOCATION_TAB(V_SEQ_NO).WAREHOUSE := D.WAREHOUSE;
+END IF;
+    -- NO-PLAN, END
+    --
+
+  END LOOP; --DEMAND CURSOR END
+
+FORALL A IN ALLOCATION_TAB.FIRST..ALLOCATION_TAB.LAST
+INSERT INTO MRP_ALLOCATION_TEMP VALUES ALLOCATION_TAB(A);
+ALLOCATION_TAB.DELETE;
+COMMIT;
+-- INSERTING INTO MRP_ALLOCATION_TEMP TABLE,END
+END LOOP; --ITEM CURSOR END
+END IF;
+COMMIT;
+--          IF ALLOCATION_TAB.COUNT > 0 
+--          THEN
+--          FOR I IN ALLOCATION_TAB.FIRST..ALLOCATION_TAB.LAST
+--          LOOP  
+--            DISPLAY('===================================================================================');
+--            DISPLAY('ALLOCATE FROM : '||ALLOCATION_TAB(I).SEQ_NO||' , '||ALLOCATION_TAB(I).ALLOCATE_FROM||' QTY : '||ALLOCATION_TAB(I).QTY||' LOT_NO: '||ALLOCATION_TAB(I).LOT_NO);
+--            DISPLAY('===================================================================================');
+--          END LOOP;
+--          END IF;
+
+--DISPLAY('--------------Normal Demand end-------------------');
+--END IF;--1=2
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging C_DEMAND' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+IF V_EXECUTION_TIME='Y' THEN
+  V_START_DATE    :=SYSDATE;
+  V_START_TIME    :=DBMS_UTILITY.GET_TIME;
+  SP_PROCESSING_TIME('Pegging Post pegging' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+-- ITEMS LOOP FOR DEMAND, END
+UPDATE MRP_ALLOCATION_TEMP O
+SET O.hierarchy_level = 
+NVL((SELECT I.HIERARCHY_LEVEL
+  FROM MRP_ALLOCATION_TEMP I
+  WHERE I.PARENT_ORDER_NO = O.PARENT_ORDER_NO
+  AND I.ITEM_NO = O.ITEM_NO
+  AND LENGTH(I.HIERARCHY_LEVEL) > LENGTH(O.HIERARCHY_LEVEL)
+  AND ROWNUM = 1
+ ),O.hierarchy_level);
+-- UPDAITNG DUE DATE ,START
+   UPDATE MRP_ALLOCATION_TEMP a
+      SET due_date =
+        (SELECT MIN(due_date)
+        FROM MRP_ALLOCATION_TEMP
+        WHERE work_order_no=a.work_order_no
+        AND order_no NOT LIKE '%QC_ALLW'
+        )
+      WHERE A.ORDER_NO LIKE '%QC_ALLW';
+      
+      UPDATE MRP_ALLOCATION_TEMP a
+      SET due_date =
+        (SELECT NVL(REQUIRED_DATE,ENTRY_DATE)
+        FROM MFG_WORK_ORDER
+        WHERE work_order_no=a.work_order_no
+        )
+      WHERE A.ORDER_NO LIKE '%QC_ALLW' AND due_date IS NULL ;
+      
+      UPDATE MRP_ALLOCATION_TEMP a
+      SET required_date      = due_date
+      where a.ALLOCATION_TYPE='SO_WO';      
+      
+            UPDATE MRP_ALLOCATION_TEMP A
+      SET REQUIRED_DATE =
+        (SELECT MIN(DUE_DATE)
+        FROM MRP_ALLOCATION_TEMP
+        WHERE PARENT_WORK_ORDER_NO = A.PARENT_WORK_ORDER_NO
+        )
+      WHERE A.ALLOCATION_TYPE = 'WO_CO';
+
+--        For X In (     Select Item_No
+--           From Im_Items Where Include_Mrp='Y'   Order By Low_Level_Code) LOOP
+--               For Y In 
+--               (  Select  B.Work_Order_No As Order_No,
+----               Working_Date_From_Date(Trunc(F.Alloc_Due_Date),
+----                DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',
+----                -NVL(PROCESSING_DAYS,0),
+----                 -Nvl(E.Mrp_Lead_Time,0))) As Due_Date
+--      nvl(SF_GET_LEADTIME_BS(B.Work_Order_No,Trunc(F.Alloc_Due_Date)),Trunc(F.Alloc_Due_Date)) As Due_Date
+--               from  mfg_work_order b ,MRP_ALLOCATION_TEMP  d, im_items e,
+--                    (select min(due_date) alloc_due_date, work_order_no from MRP_ALLOCATION_TEMP
+--                      where order_no not like '%QC_ALLW%' group by work_order_no) f
+--              where  nvl(b.do_not_include_in_planning,'N')='N'
+--               And   B.Work_Order_No = D.Work_Order_No 
+--               AND   B.Item_No = X.ITEM_NO 
+--               And   B.Work_Order_No = F.Work_Order_No
+--               And   B.Item_No = E.Item_No
+--                ) Loop
+--               
+--                     Update   MRP_ALLOCATION_TEMP
+--                     Set   Due_Date=Y.Due_Date
+--                     Where Order_No=Y.Order_No
+--                     AND Allocation_Type='WO_CO';
+--             End Loop;    
+--       End Loop;         
+
+        For X In (     Select Item_No
+           From Im_Items Where Include_Mrp='Y'   Order By Low_Level_Code) LOOP
+               For Y In 
+               (  Select  B.Work_Order_No As Order_No,
+               Working_Date_From_Date(Trunc(F.Alloc_Due_Date),
+                DECODE(R_APP_SETTINGS.IM_LEAD_TIME,'C',
+                -NVL(PROCESSING_DAYS,0),
+                 -Nvl(E.Mrp_Lead_Time,0))) As Due_Date
+               from  mfg_work_order b ,MRP_ALLOCATION_TEMP  d, im_items e,
+                    (select min(due_date) alloc_due_date, work_order_no from MRP_ALLOCATION_TEMP
+                      where order_no not like '%QC_ALLW%' group by work_order_no) f
+              where  nvl(b.do_not_include_in_planning,'N')='N'
+               And   B.Work_Order_No = D.Work_Order_No 
+               AND   B.Item_No = X.ITEM_NO 
+               And   B.Work_Order_No = F.Work_Order_No
+               And   B.Item_No = E.Item_No
+                ) Loop
+               
+                     Update   MRP_ALLOCATION_TEMP
+                     Set   Due_Date=Y.Due_Date
+                     Where Order_No=Y.Order_No
+                     AND Allocation_Type='WO_CO';
+             End Loop;    
+       End Loop;    
+           update Mrp_Allocation_Temp
+           set CUMULATIVE_LEAD_TIME = (SELECT CUM_MRP_LEAD_TIME
+                                            FROM im_items z
+                                              WHERE z.item_no=Mrp_Allocation_Temp.item_no)
+           where  ITEM_NO IN (SELECT G.ITEM_NO FROM im_items g
+                 Where G.Procurement_Type           In('M','A')
+                 ); 
+-- UPDATING DUE DATE , END
+If P_Cliet =  'TEST' Then 
+  Null;
+Elsif P_Cliet =  'PROD' Then 
+  Delete From Inv_Allocation;
+INSERT INTO INV_ALLOCATION 
+(
+	PARENT_SEQ_NO,			PARENT_PEGGING_TYPE,	ORDER_NO,					LINE_NO,				DUE_DATE,
+	QTY,					WORK_ORDER_NO,			ITEM_NO,					CREATED_BY,				CREATED_DATE,
+	CHANGED_BY,				CHANGED_DATE,			SEQ_NO,						PEGGING_TYPE,			PARENT_WORK_ORDER_NO,
+	ALLOCATION_TYPE,		WO_RELEASE_DATE,		PARENT_ORDER_NO,			PARENT_ORDER_LINE_NO,	PO_NO,
+	PO_LINE_NO,				PARENT_ITEM_NO,			FINAL_WORK_ORDER_NO,		CUMMULATIVE_SCRAP_QTY,	LEVEL_CODE,
+	HIERARCHY_LEVEL,		RECOMMENDED_QTY,		REQUIRED_DATE,ORDER_CREATED,ITEM_REVISION_NO,		PRIORITY_CODE,
+	VENDOR_NO,LOT_NO,		REASON_CODE,			LEAD_TIME,					CUMULATIVE_LEAD_TIME,	PEGGING_WITHIN_LEAD_TIME,
+  WAREHOUSE,ALLOCATE_FROM
+)
+SELECT 
+	PARENT_SEQ_NO,			PARENT_PEGGING_TYPE,	ORDER_NO,					LINE_NO,				NVL(DUE_DATE,V_SYSDATE),
+	QTY,					WORK_ORDER_NO,			ITEM_NO,					P_USER,				SYSDATE,
+	CHANGED_BY,				CHANGED_DATE,			SEQ_NO,										case when due_date <=sysdate+R_APP_SETTINGS.HARD_PEGGING_WINDOW_DAYS then 'H' else 'S' end	 PEGGING_TYPE,			PARENT_WORK_ORDER_NO,
+	ALLOCATION_TYPE,		WO_RELEASE_DATE,		PARENT_ORDER_NO,			PARENT_ORDER_LINE_NO,	PO_NO,
+	PO_LINE_NO,				PARENT_ITEM_NO,			FINAL_WORK_ORDER_NO,		CUMMULATIVE_SCRAP_QTY,	LEVEL_CODE,
+	HIERARCHY_LEVEL,		RECOMMENDED_QTY,		REQUIRED_DATE,ORDER_CREATED,ITEM_REVISION_NO,	PRIORITY_CODE,--	100 PRIORITY_CODE,
+	VENDOR_NO,LOT_NO,		REASON_CODE,			LEAD_TIME,					CUMULATIVE_LEAD_TIME,	PEGGING_WITHIN_LEAD_TIME,
+  WAREHOUSE,ALLOCATE_FROM
+From Mrp_Allocation_Temp
+WHERE QTY > 0;
+END IF;
+--    SP_MRP_SUMMARY;
+SP_mrp_PEGG_SUMMARY;
+--    SP_ALLOCATION_AUDIT;
+    LP_CLEAR_TEMP_DATA;
+    COMMIT;
+SP_UPD_RECOMMENDED_QTY;
+COMMIT;
+SP_UPD_WO_PRIORITY_ALLOCATION;
+COMMIT;
+SP_UPD_WO_PITEMS_PWOS;
+COMMIT;
+
+--START
+UPDATE MFG_WORK_ORDER
+  SET ALLOCATION_DETAILS =NULL;
+
+BEGIN
+FOR WO IN (
+SELECT ORDER_NO,RTRIM(LISTAGG(WO_UPD||STOCK_UPD,',') WITHIN GROUP(ORDER BY ORDER_NO),',') UPD
+FROM(
+SELECT ORDER_NO,'WO => '||LISTAGG(UPD,CHR(10)) WITHIN GROUP(ORDER BY ORDER_NO) AS WO_UPD,NULL STOCK_UPD
+FROM (
+SELECT DISTINCT  I.ORDER_NO,I.LINE_NO,I.WORK_ORDER_NO||'~'||I.ITEM_NO||'~'||to_char(I.due_date,'MM/DD/YY')||'~'||' OP Comp. : '||(
+    (
+      SELECT COUNT(DISTINCT MFG_TC_DETAIL.STEP_ID)
+      FROM MFG_TC_DETAIL ,
+        MFG_WO_ROUTING
+      WHERE MFG_TC_DETAIL.WORK_ORDER_NO         =I.WORK_ORDER_NO--wo.WORK_ORDER_NO
+      AND NVL(MFG_TC_DETAIL.STEP_COMPLETED ,'N')='Y'
+      AND MFG_TC_DETAIL.WORK_ORDER_NO           =MFG_WO_ROUTING.WORK_ORDER_NO
+      AND MFG_TC_DETAIL.STEP_ID                 =MFG_WO_ROUTING.STEP_ID
+    )
+    +
+    (
+    SELECT COUNT(1) 
+      FROM MFG_WO_ROUTING
+      WHERE MFG_WO_ROUTING.WORK_ORDER_NO         = I.WORK_ORDER_NO--wo.WORK_ORDER_NO
+      AND MFG_WO_ROUTING.OPERATION_TYPE = 'OP'
+      AND STEP_COMPLETE_DATE IS NOT NULL
+    )    
+    ||'/'
+    ||
+    (
+      SELECT COUNT(OPERATION_CODE)
+      FROM MFG_WO_ROUTING
+      WHERE WORK_ORDER_NO=I.WORK_ORDER_NO--wo.WORK_ORDER_NO
+    )
+    )||',' UPD
+-- ORDER_NO,LINE_NO,ITEM_NO,WORK_ORDER_NO,QTY 
+ FROM INV_ALLOCATION I,MFG_WORK_ORDER WO,IM_ITEMS IM
+ WHERE I.ALLOCATION_TYPE <> 'SO_WO'
+ AND NVL(I.WORK_ORDER_NO,'PO') NOT IN ('NO-PLAN', 'PO','STOCK','ISSUED')
+ AND I.ORDER_NO = WO.WORK_ORDER_NO
+ AND IM.ITEM_NO = I.ITEM_NO
+ AND IM.PROCUREMENT_TYPE IN ('A','M')
+ ORDER BY I.ORDER_NO,I.LINE_NO
+ )
+ GROUP BY ORDER_NO
+UNION ALL
+SELECT ORDER_NO,NULL WO_UPD,'STOCK => '||LISTAGG(UPD,CHR(10)) WITHIN GROUP(ORDER BY ORDER_NO) AS STOCK_UPD
+FROM (
+      SELECT DISTINCT I.ORDER_NO,I.LINE_NO,LOT_NO,(SELECT WORK_ORDER_NO||'~'
+                                     FROM V_INVENTORY_LEDGER
+                                    WHERE LOT_NO = I.LOT_NO
+                                      AND WORK_ORDER_NO IS NOT NULL
+                                      AND ROWNUM = 1 
+                                   )||I.ITEM_NO||'~'||'*'||',' UPD
+      -- ORDER_NO,LINE_NO,ITEM_NO,WORK_ORDER_NO,QTY 
+       FROM INV_ALLOCATION I,MFG_WORK_ORDER WO,IM_ITEMS IM
+       WHERE I.ALLOCATION_TYPE <> 'SO_WO'
+       AND EXISTS (SELECT 1 FROM V_INVENTORY_LEDGER II WHERE II.LOT_NO = I.LOT_NO AND  WORK_ORDER_NO IS NOT NULL)
+       AND IM.ITEM_NO = I.ITEM_NO
+       AND IM.PROCUREMENT_TYPE IN ('A','M')
+       AND NVL(I.WORK_ORDER_NO,'PO') IN ('STOCK')
+       AND I.ORDER_NO = WO.WORK_ORDER_NO
+       ORDER BY I.ORDER_NO,I.LINE_NO
+      )
+GROUP BY ORDER_NO
+)
+group by order_no
+)
+LOOP
+  UPDATE MFG_WORK_ORDER
+  SET ALLOCATION_DETAILS = REPLACE(WO.UPD,',,',','||CHR(10))
+  WHERE WORK_ORDER_NO = WO.ORDER_NO;
+END LOOP;
+-- S
+--sp_prev_curr;
+-- E
+-- S
+BEGIN
+--EXECUTE IMMEDIATE 'DROP TABLE INV_ALLOCATION';
+--EXECUTE IMMEDIATE  'CREATE TABLE INV_ALLOCATION AS SELECT * FROM INV_ALLOCATION';
+--EXECUTE IMMEDIATE  'ALTER TABLE INV_ALLOCATION ADD HLEVEL NUMBER';
+--EXECUTE IMMEDIATE  'ALTER TABLE INV_ALLOCATION ADD HLEVEL_PAD NUMBER'
+
+UPDATE INV_ALLOCATION
+SET HLEVEL = (CASE
+                WHEN ALLOCATION_TYPE IN ('FO_WO','SO_WO') THEN
+                  1
+                ELSE
+                  NULL
+                END 
+              ),
+HLEVEL_PAD = (CASE
+                WHEN ALLOCATION_TYPE IN ('FO_WO','SO_WO') THEN
+                  1
+                ELSE
+                  NULL
+                END 
+              );
+FOR H IN 
+(
+  SELECT ALLOCATION_TYPE ,ORDER_NO,LINE_NO,ITEM_NO
+  FROM INV_ALLOCATION
+  WHERE ALLOCATION_TYPE in ('SO_WO','FO_WO')
+  AND HLEVEL IS NOT NULL
+)
+LOOP
+
+  FOR J IN (
+  Select PARENT_NO, COMPONENT_NO ITEM_NO   ,LEVEL+1 HLEVEL_PAD ,ROWNUM+1 HLEVEL
+  From T_Bom_Parent_Component
+  Connect By Nocycle Parent_No = PRIOR Component_No --And Parent_Rev_No=P_Rev
+  Start With PARENT_No = H.ITEM_NO
+  )
+  LOOP
+      UPDATE INV_ALLOCATION o
+      SET HLEVEL = J.HLEVEL,
+      HLEVEL_PAD = J.HLEVEL_PAD
+      WHERE ITEM_NO = J.ITEM_NO 
+      AND PARENT_ORDER_NO = H.ORDER_NO
+      AND PARENT_ORDER_LINE_NO = H.LINE_NO
+      AND (select i.item_no
+             from inv_allocation i
+            where i.seq_no = o.parent_seq_no
+              and rownum = 1
+           ) = j.PARENT_NO;
+  END LOOP;
+END LOOP;
+
+--
+UPDATE INV_ALLOCATION
+SET HLEVEL = (CASE
+                WHEN ALLOCATION_TYPE='WO_CO' THEN
+                  555
+                ELSE
+                  HLEVEL
+                END 
+              ),
+HLEVEL_PAD = (CASE
+                WHEN ALLOCATION_TYPE='WO_CO' THEN
+                  555
+                ELSE
+                  HLEVEL_PAD
+                END 
+              )
+WHERE HLEVEL IS NULL;
+
+FOR H IN 
+(
+  SELECT ALLOCATION_TYPE ,ORDER_NO,LINE_NO,PARENT_ITEM_NO ITEM_NO
+  FROM INV_ALLOCATION
+  WHERE ALLOCATION_TYPE='WO_CO'
+  AND HLEVEL = 555
+)
+LOOP
+    FOR J IN (
+  Select PARENT_NO, COMPONENT_NO ITEM_NO   ,LEVEL+2 HLEVEL_PAD ,ROWNUM+2 HLEVEL
+  From T_Bom_Parent_Component
+  Connect By Nocycle Parent_No = PRIOR Component_No --And Parent_Rev_No=P_Rev
+  Start With PARENT_No = H.ITEM_NO
+  )
+  LOOP
+      UPDATE INV_ALLOCATION
+      SET HLEVEL = J.HLEVEL,
+      HLEVEL_PAD = J.HLEVEL_PAD
+      WHERE ITEM_NO = J.ITEM_NO 
+      AND PARENT_ORDER_NO LIKE '%'||H.ORDER_NO||'%';
+      --AND PARENT_ORDER_LINE_NO = H.LINE_NO;
+  END LOOP;
+END LOOP;
+UPDATE INV_ALLOCATION
+SET HLEVEL_PAD = 2,HLEVEL=2
+WHERE HLEVEL_PAD = 555;
+COMMIT;
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+
+-- E
+-- s
+   --New Sp_Ship_Date_Upd_Mat_Status logic commented above and included below
+    DELETE FROM INV_ALLOCATION_tmp_mstatus;
+    --where ITEM_NO = NVL(P_ITEM_NO,ITEM_NO);
+    commit;
+    insert into INV_ALLOCATION_tmp_mstatus
+    (ORDER_NO,LINE_NO,DUE_DATE,QTY,WORK_ORDER_NO,
+     ITEM_NO,CREATED_BY,CREATED_DATE,CHANGED_BY,CHANGED_DATE,
+     SEQ_NO,PEGGING_TYPE,PARENT_WORK_ORDER_NO,ALLOCATION_TYPE,
+     wo_release_date,PARENT_ORDER_NO,PARENT_ORDER_LINE_NO,PO_NO,
+     PO_LINE_NO,PARENT_ITEM_NO,FINAL_WORK_ORDER_NO,CUMMULATIVE_SCRAP_QTY,
+     RECOMMENDED_QTY,HIERARCHY_LEVEL,LEVEL_CODE,REQUIRED_DATE,
+     ORDER_CREATED,ITEM_REVISION_NO,PRIORITY_CODE)
+    select ORDER_NO,LINE_NO,DUE_DATE,QTY,WORK_ORDER_NO,ITEM_NO,CREATED_BY,CREATED_DATE,CHANGED_BY,CHANGED_DATE,SEQ_NO,
+    PEGGING_TYPE,PARENT_WORK_ORDER_NO,ALLOCATION_TYPE,wo_release_date,PARENT_ORDER_NO,PARENT_ORDER_LINE_NO,PO_NO,
+    PO_LINE_NO,PARENT_ITEM_NO,FINAL_WORK_ORDER_NO,CUMMULATIVE_SCRAP_QTY,RECOMMENDED_QTY,HIERARCHY_LEVEL,LEVEL_CODE,
+    REQUIRED_DATE,ORDER_CREATED,ITEM_REVISION_NO ,PRIORITY_CODE
+    from INV_ALLOCATION where NVL(ALLOCATION_TYPE,'#?#') <> 'BOM_CO'
+    and ITEM_NO = NVL(P_ITEM_NO,ITEM_NO);
+    commit;
+    
+    DELETE FROM inv_allocation_mstatus;
+    --where ITEM_NO = NVL(P_ITEM_NO,ITEM_NO);
+    commit;
+    
+    insert into inv_allocation_mstatus
+    (ORDER_NO,LINE_NO,DUE_DATE,QTY,WORK_ORDER_NO,
+     ITEM_NO,CREATED_BY,CREATED_DATE,CHANGED_BY,CHANGED_DATE,
+     SEQ_NO,PEGGING_TYPE,PARENT_WORK_ORDER_NO,ALLOCATION_TYPE,
+     wo_release_date,PARENT_ORDER_NO,PARENT_ORDER_LINE_NO,PO_NO,
+     PO_LINE_NO,PARENT_ITEM_NO,FINAL_WORK_ORDER_NO,CUMMULATIVE_SCRAP_QTY,
+     RECOMMENDED_QTY,HIERARCHY_LEVEL,LEVEL_CODE,REQUIRED_DATE,
+     ORDER_CREATED,ITEM_REVISION_NO,PRIORITY_CODE)
+    
+    select ORDER_NO,LINE_NO,DUE_DATE,QTY,WORK_ORDER_NO,ITEM_NO,CREATED_BY,CREATED_DATE,CHANGED_BY,CHANGED_DATE,SEQ_NO,
+    PEGGING_TYPE,PARENT_WORK_ORDER_NO,ALLOCATION_TYPE,wo_release_date,PARENT_ORDER_NO,PARENT_ORDER_LINE_NO,PO_NO,
+    PO_LINE_NO,PARENT_ITEM_NO,FINAL_WORK_ORDER_NO,CUMMULATIVE_SCRAP_QTY,RECOMMENDED_QTY,HIERARCHY_LEVEL,LEVEL_CODE,
+    REQUIRED_DATE,ORDER_CREATED,ITEM_REVISION_NO ,PRIORITY_CODE
+    from inv_allocation_tmp_mstatus;--  where ITEM_NO = NVL(P_ITEM_NO,ITEM_NO);
+    commit;
+declare
+  V_MAT_PLAN_STATUS varchar2(100);
+  V_MAT_STATUS varchar2(100);
+begin
+  for i in (select work_order_no from v_work_order_status where work_order_status <> 'CL') loop
+      v_mat_status := Sf_Get_Wo_Mat_Status_alloc(i.work_order_no);
+      v_mat_plan_status := Sf_Get_Wo_Mat_plan_Status(i.work_order_no);
+      update mfg_work_order
+       set mat_status = v_mat_status,
+           mat_planning_status = v_mat_plan_status
+     where work_order_no = i.work_order_no;
+  end loop;
+exception when others then null;  
+end;
+  Sp_AO_Transfer;
+  COMMIT;
+     --Updating the Cumm Lead time for NO Plan orders based on the qty.
+     if R_APP_SETTINGS.IM_LEAD_TIME='C' THEN
+          DECLARE
+               TYPE CUM_REC_TYPE IS RECORD
+               (
+                  ITEM_NO                 inv_allocation.ITEM_NO%TYPE,
+                  qty                     inv_allocation.qty%TYPE,
+                  CUMULATIVE_LEAD_TIME       inv_allocation.CUMULATIVE_LEAD_TIME%TYPE
+               );
+               TYPE CUM_REC_TYPE_t IS TABLE OF CUM_REC_TYPE;
+               V_CUM_REC_TYPE_t   CUM_REC_TYPE_t;
+            BEGIN
+                    select ITEM_NO,qty,
+                               CEIL(NVL(SF_GET_ITEM_Cum_LEAD_DAYS2(ITEM_NO,qty),0)) CUMULATIVE_LEAD_TIME
+                              BULK COLLECT INTO V_CUM_REC_TYPE_t
+                              from ( select distinct ITEM_NO ITEM_NO ,qty qty
+                              from inv_allocation
+                              where WORK_ORDER_NO='NO-PLAN'
+             AND  ITEM_NO IN (SELECT G.ITEM_NO FROM im_items g
+             WHERE G.PROCUREMENT_TYPE           IN('M','A')
+             AND G.ITEM_NO=inv_allocation.ITEM_NO)
+                              
+                              );
+              IF V_CUM_REC_TYPE_t.COUNT >0 THEN
+                   FOR indx IN 1 .. V_CUM_REC_TYPE_t.COUNT
+                   LOOP
+                      update inv_allocation set CUMULATIVE_LEAD_TIME=V_CUM_REC_TYPE_t(indx).CUMULATIVE_LEAD_TIME
+                          where ITEM_NO=V_CUM_REC_TYPE_t(indx).ITEM_NO
+                            and qty=V_CUM_REC_TYPE_t(indx).qty
+                            and WORK_ORDER_NO='NO-PLAN';
+                   END LOOP;
+              END IF;
+            END;
+       else
+       
+           update inv_allocation
+           set CUMULATIVE_LEAD_TIME = (select CUM_MRP_LEAD_TIME from im_items z where z.item_no=inv_allocation.item_no)
+           where  ITEM_NO IN (SELECT G.ITEM_NO FROM im_items g
+                 WHERE G.PROCUREMENT_TYPE           IN('M','A')
+                 );
+       
+       end if;  
+
+  
+-- e
+COMMIT;
+EXCEPTION WHEN OTHERS THEN raise_application_error(-20500,'error :'||sqlerrm||dbms_utility.format_error_backtrace());
+END;
+
+-- END
+COMMIT;
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging Post pegging' ,V_START_DATE ,
+  NULL ,(( DBMS_UTILITY.GET_TIME-V_START_TIME)/100)) ;
+END IF;
+
+
+IF V_EXECUTION_TIME='Y' THEN
+  SP_PROCESSING_TIME('Pegging Ended ' ,V_MAIN_START_DATE ,SYSDATE ,((
+  DBMS_UTILITY.GET_TIME-V_MAIN_START_TIME)/100)) ;
+END IF;  
+exception when others then 
+V_ERR := SUBSTR(dbms_utility.format_error_backtrace()||sqlerrm,1,3499);
+INSERT INTO MRP_EXCEPTION(EXCEPTION_DETAILS)
+VALUES('D_TIME : '||TO_CHAR(SYSDATE,'DD-MON-YY HH:MI:SS AM')||' BACKTRACE : '||V_ERR );
+COMMIT;
+raise_application_error(-20555,V_ERR);
+
+END SP_MRP_PEGGING;
+
+PROCEDURE SP_UPD_ITEMS_IN_MRP AS      
+ v_top_part im_items.item_no%type;      
+ cursor c_orders is      
+  select distinct a.item_no      
+  from V_SO_LINE_BALANCE_QTY a      
+  where a.balance_qty_buom > 0;      
+
+  cursor C_COMPONENTS is         
+     Select Distinct Component_No      
+  From R_Bom_Hierarchy_Report      
+    Where Exists      
+    (Select 1      
+  from V_SO_LINE_BALANCE_QTY a      
+  Where A.Balance_Qty_Buom > 0      
+    and a.ITEM_NO =TOP_PART);      
+          
+ Cursor c_wo is 
+  select work_order_no,item_no      
+  FROM V_WORK_ORDER      
+  where WORK_ORDER_STATUS<>'CL'      
+  AND WORK_ORDER_TYPE not in ('REPAIR','MAINTENANCE');      
+          
+ Cursor c_wo_bom (p_wo_no varchar2) is      
+  select item_no      
+  from mfg_wo_bom      
+  where work_order_no=p_wo_no;     
+     
+    cursor C_COMPONENTS_wo is         
+Select Distinct Component_No      
+  From R_Bom_Hierarchy_Report      
+    Where Exists      
+    (Select 1      
+  from mfg_wo_bom  a , mfg_work_order b     
+  Where  a.work_order_no = b.work_order_no 
+  AND  b.STATUS IN ('OR','ON','OE') AND   
+  a.ITEM_NO = TOP_PART);     
+BEGIN 
+
+  update im_items      
+     SET INCLUDE_MRP='N';      
+  if R_APP_SETTINGS.REORDER_POINT_FLG = 'Y' then   
+     update im_items      
+        SET INCLUDE_MRP='Y'   
+      Where  Nvl(Inactive,'N')='N' and nvl(Reorder_Point,0)>0 ;     
+  end if;   
+           
+  for i in c_orders loop      
+    v_top_part := i.item_no;      
+    update im_items      
+       set include_mrp = 'Y'      
+     where ITEM_NO = I.ITEM_NO;      
+  end LOOP;      
+        
+  for j in c_components loop      
+      update im_items      
+       set INCLUDE_MRP = 'Y'      
+     where ITEM_NO = J.COMPONENT_NO;      
+  end LOOP;      
+          
+  for i in c_wo loop      
+      UPDATE IM_ITEMS      
+         SET INCLUDE_MRP = 'Y'      
+       WHERE ITEM_NO = I.ITEM_NO;      
+             
+       FOR J IN C_WO_BOM (I.WORK_ORDER_NO) LOOP      
+           UPDATE IM_ITEMS      
+              SET INCLUDE_MRP = 'Y'      
+              WHERE ITEM_NO = J.ITEM_NO;      
+       END LOOP;      
+             
+  END LOOP;      
+    for j in C_COMPONENTS_wo loop      
+      update im_items      
+       set INCLUDE_MRP = 'Y'      
+     where ITEM_NO = J.COMPONENT_NO;      
+  end LOOP;       
+  commit;      
+END SP_UPD_ITEMS_IN_MRP;  
+
+PROCEDURE SP_UPD_ITEMS_IN_MRP(P_ITEM_NO VARCHAR2)
+IS
+BEGIN
+  update im_items      
+     set INCLUDE_MRP = 'N';
+     
+  UPDATE im_items      
+       set INCLUDE_MRP = 'Y'
+       WHERE ITEM_NO = P_ITEM_NO;      
+
+  UPDATE im_items      
+       set INCLUDE_MRP = 'Y'
+       WHERE ITEM_NO IN (  SELECT COMPONENT_NO
+                            FROM R_Bom_Hierarchy_Report
+                           WHERE TOP_PART = P_ITEM_NO
+                        );      
+     
+END SP_UPD_ITEMS_IN_MRP;  
+PROCEDURE Sp_Update_Llc_Material_Master IS
+      /****************************************************************************
+         PURPOSE:
+         =======
+         This SP is used for updating the LLC (Lowest Level Component) in Material
+         Master for all the existing materials as per its order in the BOM/Routing
+         Entry.
+
+         PARAMETERS:
+         ===========
+         P_Client         - Client ID
+
+         OUTPUT:
+         =======
+         None
+
+         MODIFICATION HISTORY:
+         ====================
+         Date       Release       By            Description
+         --------  -----------   --------      -------------------------------
+         09-Aug-10  N.A.          Emmanuel    newly created for the new architecture
+
+      ***************************************************************************/
+
+      --Declare variables
+      V_parent_no                   V_BOM_PARENT_COMPONENT.Parent_no%TYPE;
+      V_level                       IM_ITEMS.LOW_LEVEL_CODE%TYPE;
+      V_cur_level                   IM_ITEMS.LOW_LEVEL_CODE%TYPE;
+      V_component_no                V_bom_PARENT_COMPONENT.Component_no%TYPE;
+      V_mat_no                      IM_ITEMS.ITEM_NO%TYPE;
+      V_item_no                      IM_ITEMS.ITEM_NO%TYPE;
+      v_revision_no                 im_items.current_revision_no%type;
+      v_low_level_code              im_items.low_level_code%type;
+      v_work_order_no               mfg_work_order.work_order_no%type;
+
+      -- Cursor to fetch all the materials for which the LLC field value as  NULL
+      CURSOR Cur_bom_items IS
+         SELECT DISTINCT A.Item_no,A.ITEM_REVISION_NO
+           FROM MFG_BOM_MASTER A ORDER BY A.Item_no;
+          -- where nvl(include_mrp,'N')='Y';
+
+        Cursor c_items is
+        select distinct * from
+(select  a.item_no, d.low_level_code,b.item_revision_no
+        from im_items a, mfg_wo_bom b,mfg_work_order c, im_items d
+        where a.low_level_code<=d.low_level_code
+    and d.low_level_code<>99
+    and a.low_level_code <> 99
+        and a.item_no=b.item_no
+        and b.work_order_no=c.work_order_no
+        and c.item_no=d.item_no
+    and Pkg_Status.Sf_Check_Status('MFG_WORK_ORDER',c.work_order_no,c.business_unit_code,NULL,NULL,NULL,NULL) = 'OR'
+      and b.item_no<>c.item_no
+    order by a.low_level_code desc  ) ;
+
+    cursor c_llc_upd_low_level(p_item_no varchar2, p_revision_no varchar2) is
+    select component_no as item_no, level
+         FROM V_BOM_PARENT_COMPONENT
+         CONNECT BY PRIOR Parent_no = Component_no
+         START WITH parent_no =  p_Item_no
+           AND NVL(ITEM_REVISION_NO,'-') = NVL(p_REVISION_NO,'-')
+       order by level;
+
+   BEGIN
+      /*INSERT INTO A_error_gldata
+                  (Source_procedure,
+                   Error_text)
+           VALUES ('ROLLUP',
+                   'In LLC before process begins. Date : ' || SYSDATE || ' Time : '
+                   || TO_CHAR(SYSDATE, 'hh mi ss') );
+*/
+      -- UPDATE ALL ITMES AS LOWEST LEVEL ITEMS (99) AS DEFAULT
+     
+     
+     Execute immediate 'Truncate Table T_BOM_PARENT_COMPONENT';
+     Execute immediate 'Truncate Table COMP_NO_LEVEL';
+     
+     insert into T_BOM_PARENT_COMPONENT select * from V_BOM_PARENT_COMPONENT_PEGG;
+     
+     Commit;
+     
+     BEGIN
+     FOR I IN(    SELECT DISTINCT A.Item_no,A.ITEM_REVISION_NO
+           FROM MFG_BOM_MASTER A ORDER BY A.Item_no) LOOP
+      INSERT INTO COMP_NO_LEVEL(COMP_NO,LEVE) VALUES  
+        (I.Item_no,Sf_Get_Level(I.Item_no,I.ITEM_REVISION_NO));
+     
+     END LOOP;
+     COMMIT;
+    END;
+
+      UPDATE IM_ITEMS
+         SET Low_Level_Code = 99;
+
+      -- Find the highest level using MAX in connect-by qry
+      FOR I IN Cur_bom_items LOOP
+      v_item_no := i.item_no;
+         /*SELECT     NVL(MAX(LEVEL), 99)
+               INTO V_level
+               FROM V_BOM_PARENT_COMPONENT
+         CONNECT BY PRIOR Parent_no = Component_no
+         START WITH Component_no =  I.Item_no
+           AND NVL(ITEM_REVISION_NO,'-') = NVL(I.CURRENT_REVISION_NO,'-');*/-- commented by rajnish on 11/13/2013
+    /*SELECT     NVL(MAX(LEVEL), 99) INTO V_level
+               FROM (SELECT a.item_no parent_no, a.item_revision_no as revision_no,
+              b.item_no component_no,  b.item_revision_no
+              FROM MFG_BOM_ROUTING_MASTER a,   MFG_BOM_MASTER b
+              WHERE a.record_no  = b.record_no
+              AND a.item_no     IS NOT NULL
+              AND DEFAULT_ROUTING='Y'
+              AND DEFAULT_VERSION='Y')
+              CONNECT BY PRIOR Parent_no = Component_no and prior revision_no=item_revision_no  
+               START WITH Component_no =  I.Item_no
+              AND NVL(ITEM_REVISION_NO,'-') = NVL(I.CURRENT_REVISION_NO,'-');--added by rajnish on 11/13/2013*/       
+
+--V_level:=get_level(I.Item_no,I.ITEM_REVISION_NO);
+          V_level:=0;
+         Select Max(leve) into V_level  from COMP_NO_LEVEL where comp_no =I.Item_no;
+         
+         UPDATE IM_ITEMS
+            SET Low_level_code= V_level
+          WHERE Item_no = I.Item_no
+            AND NVL(CURRENT_REVISION_NO,'-') = NVL(I.ITEM_REVISION_NO,'-');
+        
+
+        
+      END LOOP;
+COMMIT;
+      -- Mark the LLC of parents as 0
+      UPDATE IM_ITEMS
+         SET Low_Level_Code = 0
+       WHERE Low_Level_Code = 99
+         AND (Item_no) IN (SELECT  Item_no
+                          FROM MFG_ITEMS_PRODUCED_MASTER
+                          UNION
+                          SELECT Item_No
+                          FROM MFG_BOM_ROUTING_MASTER
+                          WHERE Item_no IS NOT NULL);
+
+      COMMIT;
+      
+      for i in c_items loop
+        v_item_no := i.item_no;
+        v_revision_no := i.item_revision_no;
+        --v_work_order_no := i.work_order_no;
+        v_low_level_code:=0;
+        v_low_level_code := i.low_level_code + 1;
+
+        update im_items
+          set  low_level_code = v_low_level_code
+        where  item_no = i.item_no;
+
+        for j in c_llc_upd_low_level(v_item_no, v_revision_no) loop
+          update im_items
+             set low_level_code = v_low_level_code + j.level
+          where  item_no = j.item_no;
+
+        end loop;
+
+      end loop;
+
+      commit;
+/*
+   EXCEPTION
+      WHEN OTHERS THEN
+         INSERT INTO A_error_gldata
+                     (Source_procedure,
+                      Error_text)
+              VALUES ('ROLLUP',
+                      'In LLC EXCEPTION after select. Mat No:' || V_mat_no || ' Time : '
+                      || TO_CHAR(SYSDATE, 'hh mi ss') );
+
+         COMMIT;
+   --ROLLBACK;
+*/
+exception
+when others then
+raise_application_error(-20705,v_item_no||'-'||v_low_level_code||'-'||v_work_order_no||'-'||substr(sqlerrm,1,120));
+END Sp_Update_Llc_Material_Master;
+procedure SP_UPD_CUM_MRP_LEAD_TIME is      
+      
+v_low_level_code im_items.low_level_code%type;      
+v_prev_low_level_code im_items.low_level_code%type;      
+v_cummulative_lead_time im_items.cum_mrp_lead_time%type;      
+      
+cursor c_items is      
+select *      
+  from im_items      
+ where low_level_code=v_low_level_code      
+   AND nvl(procurement_type,'N') = 'M'  
+   and  item_no like 'TE%'
+ for update;      
+      
+      
+begin      
+      
+    update im_items      
+       set cum_mrp_lead_time = mrp_lead_time      
+     where nvl(procurement_type,'N') = 'B';      
+      
+    v_prev_low_level_code := 99;      
+      
+    loop      
+      
+        select max(low_level_code)      
+          into v_low_level_code      
+          from im_items      
+         where low_level_code < v_prev_low_level_code;      
+      
+        for i in c_items loop      
+      
+            select max(nvl(b.cum_mrp_lead_time,0))      
+              into v_cummulative_lead_time      
+              from mfg_bom_master a, im_items b, mfg_bom_routing_master c      
+             where a.ITEM_NO = b.item_no      
+               and a.bom_routing_id = i.item_no      
+               and a.record_no = c.record_no      
+            and nvl(default_version,'N')='Y'      
+            and NVL(DEFAULT_ROUTING,'N')='Y';      
+               
+            v_cummulative_lead_time:=nvl(v_cummulative_lead_time,0);   
+               
+            update im_items      
+               set cum_mrp_lead_time = nvl(mrp_lead_time,0) + v_cummulative_lead_time      
+             where current of c_items;      
+      
+      
+        end loop;      
+      
+        if v_low_level_code = 0 then      
+            exit;      
+        end if;      
+      
+        v_prev_low_level_code := v_low_level_code;      
+      
+    end loop;      
+end;  
+FUNCTION SF_GET_LEAD_TIME_DAYS(P_ITEM_NO VARCHAR2,P_QTY NUMBER,P_WORK_ORDER_NO VARCHAR2 DEFAULT NULL)
+RETURN NUMBER
+IS
+V_Lead_Time_Days Number;
+Begin
+  if P_WORK_ORDER_NO is not null then
+      Select CEIL(Sum(Days)) Into V_Lead_Time_Days
+      from (
+         select (
+          
+          (
+          ((100/NVL(LABOR_EFFICIENCY_FACTOR,100) *(
+           (
+          case when PROCESS_RATE_TYPE in ('HW','MW') then 
+                    PROCESS_HRS  
+               when PROCESS_RATE_TYPE in ('MP','HP','PM','PH','CM','CH') then
+                    P_QTY*PROCESS_HRS
+                when PROCESS_RATE_TYPE in ('HB','MB') then 
+                    PROCESS_HRS*P_QTY/DV(BATCH_SIZE)
+                ELSE
+             PROCESS_HRS
+          end 
+          ) 
+          +( SETUP_TIME ))) 
+          ) + (MOVE_HOURS)
+          +(QUEUE_HOURS))/DV((WORKING_HOURS))) Days
+          --+(QUEUE_HOURS))/DV((WORKING_HOURS*NO_CAP_CENTERS))) Days
+            From G_MRP_LEADTIME_HRS_CF
+           Where WORK_ORDER_NO  =  P_WORK_ORDER_NO
+             And Operation_Type <> 'OP'
+          Union All
+          Select Sum(Process_Hrs)/8  Days
+          From G_MRP_LEADTIME_HRS_CF
+         Where WORK_ORDER_NO  = P_WORK_ORDER_NO
+           And Operation_Type = 'OP');
+  end if;
+  IF V_LEAD_TIME_DAYS IS NULL THEN
+      Select CEIL(Sum(Days)) Into V_Lead_Time_Days
+      from (
+         select (
+          
+          (
+          ((100/NVL(LABOR_EFFICIENCY_FACTOR,100) *(
+           (
+          case when PROCESS_RATE_TYPE in ('HW','MW') then 
+                    PROCESS_HRS  
+               when PROCESS_RATE_TYPE in ('MP','HP','PM','PH','CM','CH') then
+                    P_QTY*PROCESS_HRS
+                when PROCESS_RATE_TYPE in ('HB','MB') then 
+                    PROCESS_HRS*P_QTY/DV(BATCH_SIZE)
+                ELSE
+             PROCESS_HRS
+          end 
+          ) 
+          +( SETUP_TIME ))) 
+          ) + (MOVE_HOURS)
+          +(QUEUE_HOURS))/DV((WORKING_HOURS))) Days 
+       --+(QUEUE_HOURS))/DV((WORKING_HOURS*NO_CAP_CENTERS))) Days
+             From G_MRP_LEADTIME_HRS_CF
+            Where Item_No        = P_Item_No
+              And Operation_Type <> 'OP'
+              and WORK_ORDER_NO  is null
+          Union All
+          Select Sum(Process_Hrs)/8  Days From G_MRP_LEADTIME_HRS_CF
+           Where Item_No        = P_Item_No
+             And Operation_Type = 'OP'
+             and WORK_ORDER_NO  is null )
+       v;
+  END IF;
+  if V_LEAD_TIME_DAYS is null then
+    -- V_Lead_Time_Days:=0;
+     select NVL(MRP_LEAD_TIME,0) into V_LEAD_TIME_DAYS from IM_ITEMS where ITEM_NO=P_ITEM_NO;
+  End If;
+  Return NVL(V_Lead_Time_Days,1);
+Exception
+When Others Then
+Return 1;
+END SF_GET_LEAD_TIME_DAYS;
+END;
